@@ -91,6 +91,9 @@ def visible_from_orbit(
 
 
 class MapStore:
+    # Observations averaged per landmark: running mean up to this many, then EMA.
+    FUSE_WINDOW = 8
+
     def __init__(
         self,
         cache_dir: Path | None,
@@ -103,6 +106,8 @@ class MapStore:
 
         self.live_positions = _empty_points()
         self.live_colors = _empty_colors()
+        self.live_ids = np.empty(0, dtype=np.int64)
+        self.live_counts = np.empty(0, dtype=np.int32)
         self.archive_positions = _empty_points()
         self.archive_colors = _empty_colors()
         self.disk_point_count = 0
@@ -133,17 +138,45 @@ class MapStore:
         self,
         world_points: np.ndarray,
         colors: np.ndarray,
+        ids: np.ndarray,
     ) -> None:
+        """Insert observations; refine existing landmarks that share a track id."""
         if len(world_points) == 0:
             return
-        self.live_positions = np.vstack([self.live_positions, world_points])
-        self.live_colors = np.vstack([self.live_colors, colors])
+
+        is_new = np.ones(len(ids), dtype=bool)
+        if len(self.live_ids) > 0:
+            order = np.argsort(self.live_ids)
+            sorted_ids = self.live_ids[order]
+            pos = np.minimum(np.searchsorted(sorted_ids, ids), len(sorted_ids) - 1)
+            matched = sorted_ids[pos] == ids
+            if matched.any():
+                rows = order[pos[matched]]
+                weight = np.minimum(self.live_counts[rows] + 1, self.FUSE_WINDOW)
+                step = (1.0 / weight)[:, None]
+                self.live_positions[rows] += (world_points[matched] - self.live_positions[rows]) * step
+                self.live_colors[rows] += (colors[matched] - self.live_colors[rows]) * step
+                self.live_counts[rows] = weight
+                is_new = ~matched
+
+        if is_new.any():
+            self.live_positions = np.vstack([self.live_positions, world_points[is_new]])
+            self.live_colors = np.vstack([self.live_colors, colors[is_new]])
+            self.live_ids = np.concatenate([self.live_ids, ids[is_new].astype(np.int64)])
+            self.live_counts = np.concatenate(
+                [self.live_counts, np.ones(int(is_new.sum()), dtype=np.int32)]
+            )
 
         if len(self.live_positions) > self.max_live_points:
             overflow = len(self.live_positions) - self.max_live_points
             self._move_to_archive(self.live_positions[:overflow], self.live_colors[:overflow])
-            self.live_positions = self.live_positions[overflow:]
-            self.live_colors = self.live_colors[overflow:]
+            self._keep_live(slice(overflow, None))
+
+    def _keep_live(self, selector) -> None:
+        self.live_positions = self.live_positions[selector]
+        self.live_colors = self.live_colors[selector]
+        self.live_ids = self.live_ids[selector]
+        self.live_counts = self.live_counts[selector]
 
     def archive_out_of_walker_view(
         self,
@@ -170,9 +203,7 @@ class MapStore:
         archived = self.live_positions[~visible]
         archived_colors = self.live_colors[~visible]
         self._move_to_archive(archived, archived_colors)
-
-        self.live_positions = self.live_positions[visible]
-        self.live_colors = self.live_colors[visible]
+        self._keep_live(visible)
         return len(archived)
 
     def _move_to_archive(

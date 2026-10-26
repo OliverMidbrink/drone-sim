@@ -125,33 +125,136 @@ def camera_matrix(width: int, height: int, fov_deg: float | None = None) -> np.n
     )
 
 
-def detect_points(
+TRACK_GRID_COLS = 16
+TRACK_GRID_ROWS = 9
+TRACK_REFILL_FRACTION = 0.7  # refill a cell once it drops below this share of target
+TRACK_CELL_CAP_FACTOR = 2  # max tracks per cell, as a multiple of the per-cell target
+KEYFRAME_MIN_PARALLAX_PX = 8.0  # median pixel motion vs keyframe before updating pose
+KEYFRAME_MIN_MATCHES = 60  # re-anchor the keyframe if fewer tracks survive
+
+
+def per_cell_target(target_total: int) -> int:
+    return max(3, int(np.ceil(target_total / (TRACK_GRID_COLS * TRACK_GRID_ROWS))))
+
+
+def prune_crowded(
+    points: np.ndarray,
+    ids: np.ndarray,
+    width: int,
+    height: int,
+    target_total: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cap tracks per grid cell (oldest kept) so crowded areas never starve the rest."""
+    if len(ids) == 0:
+        return points, ids
+    cap = TRACK_CELL_CAP_FACTOR * per_cell_target(target_total)
+    flat = points.reshape(-1, 2)
+    cx = np.clip((flat[:, 0] * TRACK_GRID_COLS / width).astype(int), 0, TRACK_GRID_COLS - 1)
+    cy = np.clip((flat[:, 1] * TRACK_GRID_ROWS / height).astype(int), 0, TRACK_GRID_ROWS - 1)
+    cell = cy * TRACK_GRID_COLS + cx
+
+    order = np.lexsort((ids, cell))  # by cell, then oldest id first
+    sorted_cell = cell[order]
+    group_starts = np.r_[0, np.flatnonzero(np.diff(sorted_cell)) + 1]
+    group_sizes = np.diff(np.r_[group_starts, len(order)])
+    rank = np.arange(len(order)) - np.repeat(group_starts, group_sizes)
+
+    keep = np.zeros(len(ids), dtype=bool)
+    keep[order[rank < cap]] = True
+    return points[keep], ids[keep]
+
+
+def detect_balanced(
     gray: np.ndarray,
     existing: np.ndarray | None,
-    max_corners: int,
+    target_total: int,
 ) -> np.ndarray:
-    mask = np.full(gray.shape, 255, np.uint8)
-    if existing is not None and len(existing):
-        for x, y in existing.reshape(-1, 2).astype(int):
-            cv2.circle(mask, (int(x), int(y)), 5, 0, -1)
-    corners = cv2.goodFeaturesToTrack(
-        gray,
-        maxCorners=max_corners,
-        qualityLevel=0.008,
-        minDistance=4,
-        mask=mask,
+    """Detect corners so every grid cell of the frame keeps a share of tracks."""
+    height, width = gray.shape[:2]
+    cols, rows = TRACK_GRID_COLS, TRACK_GRID_ROWS
+    per_cell = per_cell_target(target_total)
+
+    pts = (
+        np.empty((0, 2), dtype=np.float32)
+        if existing is None
+        else existing.reshape(-1, 2)
     )
-    if corners is None:
+
+    counts = np.zeros((rows, cols), dtype=np.int32)
+    free = np.full((height, width), 255, np.uint8)
+    if len(pts):
+        cx = np.clip((pts[:, 0] * cols / width).astype(int), 0, cols - 1)
+        cy = np.clip((pts[:, 1] * rows / height).astype(int), 0, rows - 1)
+        np.add.at(counts, (cy, cx), 1)
+
+        xi = np.clip(np.round(pts[:, 0]).astype(int), 0, width - 1)
+        yi = np.clip(np.round(pts[:, 1]).astype(int), 0, height - 1)
+        free[yi, xi] = 0
+        free = cv2.erode(free, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+
+    pad = 4
+    found: list[np.ndarray] = []
+    for r in range(rows):
+        y0, y1 = r * height // rows, (r + 1) * height // rows
+        for c in range(cols):
+            have = int(counts[r, c])
+            if have >= per_cell * TRACK_REFILL_FRACTION:
+                continue
+            x0, x1 = c * width // cols, (c + 1) * width // cols
+            ya, yb = max(0, y0 - pad), min(height, y1 + pad)
+            xa, xb = max(0, x0 - pad), min(width, x1 + pad)
+
+            roi_mask = np.zeros((yb - ya, xb - xa), np.uint8)
+            roi_mask[y0 - ya : y1 - ya, x0 - xa : x1 - xa] = free[y0:y1, x0:x1]
+            corners = cv2.goodFeaturesToTrack(
+                np.ascontiguousarray(gray[ya:yb, xa:xb]),
+                maxCorners=per_cell - have,
+                qualityLevel=0.004,
+                minDistance=4,
+                mask=roi_mask,
+            )
+            if corners is None:
+                continue
+            corners = corners.reshape(-1, 2)
+            corners[:, 0] += xa
+            corners[:, 1] += ya
+            found.append(corners)
+
+    if not found:
         return np.empty((0, 1, 2), dtype=np.float32)
-    return corners.astype(np.float32)
+    return np.vstack(found).astype(np.float32).reshape(-1, 1, 2)
 
 
-def merge_points(tracked: np.ndarray, fresh: np.ndarray) -> np.ndarray:
-    if len(tracked) == 0:
-        return fresh
-    if len(fresh) == 0:
-        return tracked
-    return np.vstack([tracked, fresh])
+def track_features(
+    prev_gray: np.ndarray,
+    gray: np.ndarray,
+    points: np.ndarray,
+    fb_max_px: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """LK tracking; a point is kept while LK finds it and it stays in the frame.
+
+    With fb_max_px > 0 an extra backward pass also drops points that do not
+    return to where they started (stricter, off by default).
+    """
+    height, width = gray.shape[:2]
+    forward, status, _ = cv2.calcOpticalFlowPyrLK(
+        prev_gray, gray, points, None, **LK_PARAMS
+    )
+    flat = forward.reshape(-1, 2)
+    keep = (
+        (status.reshape(-1) == 1)
+        & (flat[:, 0] >= 0)
+        & (flat[:, 0] < width - 1)
+        & (flat[:, 1] >= 0)
+        & (flat[:, 1] < height - 1)
+    )
+    if fb_max_px > 0 and keep.any():
+        backward, status_b, _ = cv2.calcOpticalFlowPyrLK(
+            gray, prev_gray, forward, None, **LK_PARAMS
+        )
+        fb_error = np.linalg.norm((points - backward).reshape(-1, 2), axis=1)
+        keep &= (status_b.reshape(-1) == 1) & (fb_error < fb_max_px)
+    return forward, keep
 
 
 def estimate_motion(
@@ -302,6 +405,14 @@ def parse_args() -> argparse.Namespace:
         help="target tracked features per frame (default: 2000)",
     )
     parser.add_argument(
+        "--fb-check",
+        type=float,
+        default=0.0,
+        metavar="PX",
+        help="drop tracks that fail a backward-flow check by more than PX pixels "
+        "(default: 0 = off, always keep tracking)",
+    )
+    parser.add_argument(
         "--max-live-points",
         type=int,
         default=50_000,
@@ -363,7 +474,20 @@ def main() -> None:
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     prev_gray = gray
-    track_points = detect_points(gray, None, args.max_features)
+    track_points = detect_balanced(gray, None, args.max_features)
+    track_ids = np.arange(len(track_points), dtype=np.int64)
+    next_track_id = len(track_points)
+
+    key_ids = np.empty(0, dtype=np.int64)
+    key_pts = np.empty((0, 2), dtype=np.float32)
+
+    def set_keyframe(points: np.ndarray, ids: np.ndarray) -> None:
+        nonlocal key_ids, key_pts
+        order = np.argsort(ids)
+        key_ids = ids[order]
+        key_pts = points.reshape(-1, 2)[order].copy()
+
+    set_keyframe(track_points, track_ids)
 
     world_rotation = np.eye(3, dtype=np.float64)
     world_position = np.zeros(3, dtype=np.float64)
@@ -398,8 +522,8 @@ def main() -> None:
         mode_label = playback_mode.name.lower() if video_active else "map only"
         return [
             (
-                f"poses: {len(trajectory)}  live: {map_store.live_count}  "
-                f"stored: {map_store.archive_count}  total: {len(map_store)}"
+                f"tracks: {len(track_points)}  poses: {len(trajectory)}  "
+                f"live: {map_store.live_count}  stored: {map_store.archive_count}"
             ),
             f"time: {t_sec:.1f}s  frame: {int(capture.get(cv2.CAP_PROP_POS_FRAMES))}  ({mode_label})",
         ]
@@ -438,79 +562,111 @@ def main() -> None:
         )
 
     def process_slam_frame(frame: np.ndarray, gray: np.ndarray) -> np.ndarray:
-        nonlocal prev_gray, track_points, processed
+        nonlocal prev_gray, track_points, track_ids, next_track_id, processed
         nonlocal world_rotation, world_position, trajectory
 
         if len(track_points) < 8:
-            track_points = detect_points(gray, None, args.max_features)
+            track_points = detect_balanced(gray, None, args.max_features)
+            track_ids = np.arange(
+                next_track_id, next_track_id + len(track_points), dtype=np.int64
+            )
+            next_track_id += len(track_points)
+            set_keyframe(track_points, track_ids)
             prev_gray = gray
             processed += 1
             if processed % args.plot_every == 0:
                 map_view.show(trajectory, map_store)
             return draw_tracks(frame, track_points)
 
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray,
-            gray,
-            track_points,
-            None,
-            **LK_PARAMS,
+        next_points, keep = track_features(
+            prev_gray, gray, track_points, args.fb_check
         )
-        status = status.reshape(-1)
-        good_previous = track_points[status == 1]
-        good_current = next_points[status == 1]
+        good_current = next_points[keep]
+        good_ids = track_ids[keep]
 
-        motion = estimate_motion(good_previous, good_current, intrinsic)
-        if motion is not None:
-            rotation, translation, inliers = motion
-            previous_inlier = good_previous[inliers].reshape(-1, 2)
-            current_inlier = good_current[inliers].reshape(-1, 2)
-
-            points_cam = triangulate_pair(
-                intrinsic,
-                rotation,
-                translation,
-                previous_inlier,
-                current_inlier,
+        # Estimate motion against the keyframe (not the previous frame) so there is
+        # enough parallax; nothing is committed until the camera has actually moved.
+        rekey = False
+        pos = np.minimum(np.searchsorted(key_ids, good_ids), len(key_ids) - 1)
+        matched = key_ids[pos] == good_ids
+        if matched.sum() < KEYFRAME_MIN_MATCHES:
+            rekey = True  # keyframe tracks lost: re-anchor, pose unchanged
+        else:
+            key_matched = key_pts[pos[matched]]
+            current_matched = good_current[matched].reshape(-1, 2)
+            ids_matched = good_ids[matched]
+            parallax = float(
+                np.median(np.linalg.norm(current_matched - key_matched, axis=1))
             )
-            valid = points_cam[:, 2] > 0.1
-            points_cam = points_cam[valid]
-            current_inlier = current_inlier[valid]
+            if parallax >= KEYFRAME_MIN_PARALLAX_PX:
+                motion = estimate_motion(key_matched, current_matched, intrinsic)
+                if motion is None:
+                    rekey = parallax > 4.0 * KEYFRAME_MIN_PARALLAX_PX
+                else:
+                    rotation, translation, inliers = motion
+                    key_inlier = key_matched[inliers]
+                    current_inlier = current_matched[inliers]
+                    inlier_ids = ids_matched[inliers]
 
-            scale = triangulation_scale(points_cam)
-            translation_scaled = translation.reshape(3) * scale
-            points_cam *= scale
+                    points_cam = triangulate_pair(
+                        intrinsic,
+                        rotation,
+                        translation,
+                        key_inlier,
+                        current_inlier,
+                    )
+                    valid = points_cam[:, 2] > 0.1
+                    points_cam = points_cam[valid]
+                    current_inlier = current_inlier[valid]
+                    inlier_ids = inlier_ids[valid]
 
-            if len(points_cam) > 0:
-                world_points = transform_points_to_world(
-                    points_cam,
-                    world_rotation,
-                    world_position,
-                )
-                colors = sample_colors(frame, current_inlier)
-                map_store.add(world_points, colors)
+                    scale = triangulation_scale(points_cam)
+                    translation_scaled = translation.reshape(3) * scale
+                    points_cam *= scale
 
-            camera_delta = -(rotation.T @ translation_scaled)
-            world_position = world_position + world_rotation @ camera_delta
-            world_rotation = world_rotation @ rotation.T
-            trajectory.append(world_position.copy())
+                    if len(points_cam) > 0:
+                        world_points = transform_points_to_world(
+                            points_cam,
+                            world_rotation,
+                            world_position,
+                        )
+                        colors = sample_colors(frame, current_inlier)
+                        map_store.add(world_points, colors, inlier_ids)
 
-            map_store.archive_out_of_walker_view(
-                world_rotation,
-                world_position,
-                intrinsic,
-                width,
-                height,
-            )
+                    camera_delta = -(rotation.T @ translation_scaled)
+                    world_position = world_position + world_rotation @ camera_delta
+                    world_rotation = world_rotation @ rotation.T
+                    trajectory.append(world_position.copy())
+
+                    map_store.archive_out_of_walker_view(
+                        world_rotation,
+                        world_position,
+                        intrinsic,
+                        width,
+                        height,
+                    )
+                    rekey = True
 
         track_points = good_current.reshape(-1, 1, 2)
-        if len(track_points) < args.max_features // 2:
-            fresh = detect_points(
-                gray,
-                track_points.reshape(-1, 2),
-                args.max_features - len(track_points),
+        track_ids = good_ids
+
+        # Thin out crowded cells, then refill every sparse cell (including newly
+        # revealed edges) so the whole image stays tracked in either direction.
+        flat_tracks, track_ids = prune_crowded(
+            track_points, track_ids, width, height, args.max_features
+        )
+        track_points = flat_tracks.reshape(-1, 1, 2)
+        fresh = detect_balanced(gray, track_points, args.max_features)
+        if len(fresh):
+            fresh_ids = np.arange(
+                next_track_id, next_track_id + len(fresh), dtype=np.int64
             )
-            track_points = merge_points(track_points, fresh)
+            next_track_id += len(fresh)
+            track_points = np.vstack([track_points, fresh])
+            track_ids = np.concatenate([track_ids, fresh_ids])
+
+        if rekey:
+            set_keyframe(track_points, track_ids)
 
         prev_gray = gray
         processed += 1
@@ -548,7 +704,10 @@ def main() -> None:
     if args.max_seconds > 0:
         print(f"Video stops after {args.max_seconds:g}s (--max-seconds 0 for full video)")
     print("Video: Rewind / Pause / Play buttons, space = pause/play, q = quit")
-    print(f"{MAP_WINDOW}: LMB orbit, RMB pan, scroll dolly, Reset button top-left")
+    print(
+        "Map window: LMB orbit, RMB pan, W/A/S/D fly, Space up, Shift down, "
+        "scroll forward/back, Reset button top-left"
+    )
     print(
         f"Map: up to {args.max_features} tracks, live cap {args.max_live_points}, "
         f"archive flush to {cache_dir or 'RAM trim only'}"

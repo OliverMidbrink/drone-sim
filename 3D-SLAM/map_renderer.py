@@ -1,4 +1,4 @@
-"""GPU 3D map view (OpenGL via moderngl): orbit, pan, dolly zoom."""
+"""GPU 3D map view (OpenGL via moderngl): orbit, pan, WASD fly, scroll forward/back."""
 
 from __future__ import annotations
 
@@ -11,12 +11,21 @@ import numpy as np
 
 from map_store import MapStore
 
-MAP_WINDOW = "3D SLAM map (LMB orbit, RMB pan, scroll dolly)"
+MAP_WINDOW = "3D SLAM map (LMB orbit, RMB pan, WASD/Space/Shift fly, scroll fwd/back)"
+
+FLY_SPEED = 0.6  # WASD speed, in view-distances per second
+SCROLL_STEP = 0.1  # scroll notch, in view-distances
 
 INTRO_FOLLOW_SECONDS = 3.0
 
+# 180° rotation about X: SLAM (x right, y down, z forward) -> view (y up, z back).
+SLAM_TO_VIEW = np.array([1.0, -1.0, -1.0])
+
+MARKER_DIAMETER_PX = 16  # camera sphere size on screen (logical pixels)
+MARKER_COLOR = (1.0, 0.25, 0.2)
+
 DEFAULT_YAW = 0.85
-DEFAULT_PITCH = -0.38
+DEFAULT_PITCH = 0.38
 
 _VERTEX_SHADER = """
 #version 330 core
@@ -37,6 +46,33 @@ in vec3 v_color;
 out vec4 fragColor;
 void main() {
     fragColor = vec4(v_color, 1.0);
+}
+"""
+
+_MARKER_VERTEX_SHADER = """
+#version 330 core
+in vec3 in_position;
+uniform mat4 mvp;
+uniform float point_size;
+void main() {
+    gl_Position = mvp * vec4(in_position, 1.0);
+    gl_PointSize = point_size;
+}
+"""
+
+# Round point sprite shaded like a lit sphere.
+_MARKER_FRAGMENT_SHADER = """
+#version 330 core
+out vec4 fragColor;
+uniform vec3 base_color;
+void main() {
+    vec2 d = gl_PointCoord * 2.0 - 1.0;
+    float r2 = dot(d, d);
+    if (r2 > 1.0) discard;
+    vec3 normal = vec3(d.x, -d.y, sqrt(1.0 - r2));
+    float light = 0.3 + 0.7 * max(dot(normalize(vec3(-0.4, 0.5, 0.75)), normal), 0.0);
+    float rim = smoothstep(0.85, 1.0, sqrt(r2));
+    fragColor = vec4(base_color * light * (1.0 - 0.35 * rim), 1.0);
 }
 """
 
@@ -112,6 +148,7 @@ class MapRenderer:
         self.pan = np.zeros(3, dtype=np.float64)
         self.focus = np.zeros(3, dtype=np.float64)
         self._user_camera = False
+        self._last_motion_time = time.monotonic()
         self._intro_start: float | None = None
         self._follow_released = False
         self._orbit_drag = False
@@ -127,6 +164,8 @@ class MapRenderer:
         self._ctx: moderngl.Context | None = None
         self._program: moderngl.Program | None = None
         self._ui_program: moderngl.Program | None = None
+        self._marker_program: moderngl.Program | None = None
+        self._marker_vbo: moderngl.Buffer | None = None
         self._reset_texture: moderngl.Texture | None = None
         self._ui_vbo: moderngl.Buffer | None = None
         self._point_vbo: moderngl.Buffer | None = None
@@ -167,6 +206,11 @@ class MapRenderer:
             vertex_shader=_UI_VERTEX_SHADER,
             fragment_shader=_UI_FRAGMENT_SHADER,
         )
+        self._marker_program = self._ctx.program(
+            vertex_shader=_MARKER_VERTEX_SHADER,
+            fragment_shader=_MARKER_FRAGMENT_SHADER,
+        )
+        self._marker_vbo = self._ctx.buffer(reserve=12)
         self._setup_reset_button()
 
         glfw.set_framebuffer_size_callback(self._window, self._on_resize)
@@ -302,8 +346,46 @@ class MapRenderer:
     def _on_scroll(self, _window, _xoffset: float, yoffset: float) -> None:
         if yoffset == 0:
             return
-        step = 0.9 if yoffset > 0 else 1.1
-        self.distance = max(0.05, self.distance * step)
+        # Scroll flies the camera forward/back along the view direction.
+        self.pan += self._view_forward() * (self.distance * SCROLL_STEP * yoffset)
+        self._user_camera = True
+        self.draw()
+
+    def _view_forward(self) -> np.ndarray:
+        return -self._orbit_direction()
+
+    def _key_down(self, key: int) -> bool:
+        return glfw.get_key(self._window, key) == glfw.PRESS
+
+    def _apply_keyboard_motion(self) -> None:
+        """WASD = fly, Space = up, Shift = down (applies while the map window has focus)."""
+        now = time.monotonic()
+        dt = min(now - self._last_motion_time, 0.1)
+        self._last_motion_time = now
+
+        forward = self._view_forward()
+        right, _ = self._camera_right_up()
+        world_up = np.array([0.0, 1.0, 0.0])
+
+        move = np.zeros(3, dtype=np.float64)
+        if self._key_down(glfw.KEY_W):
+            move += forward
+        if self._key_down(glfw.KEY_S):
+            move -= forward
+        if self._key_down(glfw.KEY_D):
+            move += right
+        if self._key_down(glfw.KEY_A):
+            move -= right
+        if self._key_down(glfw.KEY_SPACE):
+            move += world_up
+        if self._key_down(glfw.KEY_LEFT_SHIFT) or self._key_down(glfw.KEY_RIGHT_SHIFT):
+            move -= world_up
+
+        length = float(np.linalg.norm(move))
+        if length < 1e-9:
+            return
+        speed = max(self.distance, 0.5) * FLY_SPEED
+        self.pan += (move / length) * speed * dt
         self._user_camera = True
         self.draw()
 
@@ -311,6 +393,7 @@ class MapRenderer:
         if self._window is None:
             return False
         glfw.poll_events()
+        self._apply_keyboard_motion()
         return not glfw.window_should_close(self._window)
 
     def show(self, trajectory: list[np.ndarray], map_store: MapStore) -> None:
@@ -332,15 +415,22 @@ class MapRenderer:
         direction = self._orbit_direction()
         eye = target + direction * self.distance
 
+        # SLAM space is OpenCV-style (y down, z forward); the viewer is y up.
+        # The map is culled in SLAM space and converted to view space for display.
         if self._map_store is not None:
-            self._render_points, self._render_colors = self._map_store.render_subset(
-                eye,
-                target,
+            points, colors = self._map_store.render_subset(
+                eye * SLAM_TO_VIEW,
+                target * SLAM_TO_VIEW,
                 aspect,
             )
+            self._render_points = points * SLAM_TO_VIEW
+            self._render_colors = colors
         else:
             self._render_points = np.empty((0, 3), dtype=np.float64)
             self._render_colors = np.empty((0, 3), dtype=np.float64)
+
+        if len(traj):
+            traj = traj * SLAM_TO_VIEW
 
         self._update_focus_and_distance(traj, self._render_points)
         self._upload_geometry(traj, self._render_points, self._render_colors)
@@ -369,9 +459,40 @@ class MapRenderer:
             point_vao.render(moderngl.POINTS, vertices=self._point_count)
             point_vao.release()
 
+        if len(traj) > 0:
+            self._draw_camera_marker(traj[-1], mvp)
+
         self._draw_reset_button()
 
         glfw.swap_buffers(self._window)
+
+    def _draw_camera_marker(self, position: np.ndarray, mvp: np.ndarray) -> None:
+        """Sphere at the current camera position, always drawn on top of the cloud."""
+        if (
+            self._ctx is None
+            or self._marker_program is None
+            or self._marker_vbo is None
+            or self._window is None
+        ):
+            return
+
+        # Constant on-screen size (the map scale is arbitrary), in framebuffer pixels.
+        win_h = max(glfw.get_window_size(self._window)[1], 1)
+        fb_h = glfw.get_framebuffer_size(self._window)[1]
+        size_px = MARKER_DIAMETER_PX * fb_h / win_h
+
+        self._marker_vbo.write(position.astype("f4").tobytes())
+        self._marker_program["mvp"].write(mvp.astype(np.float32).T.tobytes())
+        self._marker_program["point_size"].value = float(size_px)
+        self._marker_program["base_color"].value = MARKER_COLOR
+
+        self._ctx.disable(moderngl.DEPTH_TEST)
+        marker_vao = self._ctx.vertex_array(
+            self._marker_program, [(self._marker_vbo, "3f", "in_position")]
+        )
+        marker_vao.render(moderngl.POINTS, vertices=1)
+        marker_vao.release()
+        self._ctx.enable(moderngl.DEPTH_TEST)
 
     def _draw_reset_button(self) -> None:
         if (
@@ -477,6 +598,8 @@ class MapRenderer:
             self._path_vbo.release()
         if self._ui_vbo is not None:
             self._ui_vbo.release()
+        if self._marker_vbo is not None:
+            self._marker_vbo.release()
         if self._reset_texture is not None:
             self._reset_texture.release()
         if self._window is not None:
