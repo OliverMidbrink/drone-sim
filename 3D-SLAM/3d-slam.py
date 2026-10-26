@@ -8,6 +8,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from anchor_map import (
+    MIN_AGE_STEPS,
+    NEW_VIEW_DEG,
+    SAME_POINT_TOL,
+    AnchorMap,
+    correction_between,
+    keypoint_depths,
+)
 from map_renderer import MAP_WINDOW, MapRenderer
 from map_store import MapStore
 
@@ -324,6 +332,10 @@ MIN_TRIANGULATION_DEG = 1.0  # ignore observations with less ray separation than
 MAX_RAY_GAP = 0.1  # reject if the two rays miss by more than this fraction of depth
 MAX_OBSERVATION_WEIGHT = 100.0
 MIN_SCALE_MATCHES = 12  # landmarks needed to anchor the step scale to the map
+ANCHOR_INTERVAL = 3  # look for / add anchors every Nth committed pose update
+PRUNE_INTERVAL_SECONDS = 4.0  # how often isolated landmarks are checked for
+MAX_NEW_ANCHORS = 300  # per anchor step
+MIN_ANCHOR_LANDMARK_WEIGHT = 2.0  # only well-triangulated landmarks seed anchors
 
 
 def pixel_rays(
@@ -486,6 +498,33 @@ def parse_args() -> argparse.Namespace:
         help="keep archive in RAM only (trim when full)",
     )
     parser.add_argument(
+        "--no-anchors",
+        action="store_true",
+        help="disable global anchor features (relocalisation / loop correction)",
+    )
+    parser.add_argument(
+        "--max-anchors",
+        type=int,
+        default=60_000,
+        help="max global anchor features kept (default: 60000)",
+    )
+    parser.add_argument(
+        "--prune-age",
+        type=float,
+        default=10.0,
+        metavar="SEC",
+        help="delete landmarks still isolated after this many video seconds "
+        "(default: 10, 0 = never delete)",
+    )
+    parser.add_argument(
+        "--prune-isolation",
+        type=float,
+        default=0.12,
+        metavar="FRAC",
+        help="isolated = nearest neighbour farther than FRAC x the point's distance "
+        "from the camera path (default: 0.12; typical spacing is ~0.03)",
+    )
+    parser.add_argument(
         "--plot-every",
         type=int,
         default=3,
@@ -571,6 +610,10 @@ def main() -> None:
         max_live_points=args.max_live_points,
     )
 
+    anchors = None if args.no_anchors else AnchorMap(max_anchors=args.max_anchors)
+    stats = {"commits": 0, "fixes": 0, "associated": 0, "pruned": 0}
+    prune_state = {"last": 0.0}
+
     map_height = max(320, height // 2)
     map_view = MapRenderer(width, map_height)
     map_view.setup_window()
@@ -594,7 +637,9 @@ def main() -> None:
         return [
             (
                 f"tracks: {len(track_points)}  poses: {len(trajectory)}  "
-                f"live: {map_store.live_count}  stored: {map_store.archive_count}"
+                f"live: {map_store.live_count}  stored: {map_store.archive_count}  "
+                f"anchors: {len(anchors) if anchors is not None else 0}  "
+                f"fixes: {stats['fixes']}  pruned: {stats['pruned']}"
             ),
             f"time: {t_sec:.1f}s  frame: {int(capture.get(cv2.CAP_PROP_POS_FRAMES))}  ({mode_label})",
         ]
@@ -631,6 +676,93 @@ def main() -> None:
             "Video stopped. Explore the 3D map "
             "(close the map window when finished)."
         )
+
+    def video_clock() -> float:
+        """Seconds of video processed so far (the age of landmarks is measured in this)."""
+        return processed * max(args.stride, 1) / max(video_fps, 1e-6)
+
+    def remap_ids(ids: np.ndarray, source: np.ndarray, target: np.ndarray) -> np.ndarray:
+        if len(source) == 0:
+            return ids
+        order = np.argsort(source)
+        source, target = source[order], target[order]
+        pos = np.minimum(np.searchsorted(source, ids), len(source) - 1)
+        hit = source[pos] == ids
+        out = ids.copy()
+        out[hit] = target[pos[hit]]
+        return out
+
+    def run_anchor_step(gray: np.ndarray, track_ids_now: np.ndarray, track_px: np.ndarray) -> None:
+        """Relocalise against old anchors (closing loops), then add new anchors."""
+        nonlocal world_rotation, world_position, key_ids
+        keypoints, descriptors, response = anchors.detect(gray)
+        if len(keypoints) == 0:
+            return
+        step = len(trajectory) - 1
+        query, matched = anchors.match(descriptors, world_position)
+
+        if len(query):
+            old = anchors.steps[matched] <= step - MIN_AGE_STEPS
+            fix = anchors.localize(keypoints[query[old]], matched[old], intrinsic)
+            if fix is not None:
+                start = anchors.last_fix_step
+                correction = correction_between(
+                    world_rotation, world_position, fix.rotation, fix.position
+                )
+                shift, turn = correction.magnitude
+                path = np.asarray(trajectory[start:])
+                path_len = float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) if len(path) > 1 else 0.0
+                plausible = turn < 30.0 and shift < 0.6 * path_len + 5.0 * (last_step_length or 0.0)
+                if plausible:
+                    poses = np.asarray(trajectory)
+                    fraction = np.clip(
+                        (np.arange(len(poses)) - start) / max(step - start, 1), 0.0, 1.0
+                    )
+                    moving = fraction > 0.0
+                    poses[moving] = correction.apply(poses[moving], fraction[moving])
+                    trajectory[:] = [row.copy() for row in poses]
+                    map_store.warp(correction, start, step)
+                    anchors.warp(correction, start, step)
+                    anchors.last_fix_step = step
+                    world_rotation, world_position = fix.rotation, fix.position.copy()
+                    key_ids = np.empty(0, dtype=np.int64)  # births were in the old frame
+                    stats["fixes"] += 1
+                    print(
+                        f"[anchors] fix @ step {step}: {fix.inliers}/{fix.matches} inliers, "
+                        f"shift {shift:.3f} ({shift / max(path_len, 1e-9) * 100:.0f}% of path), "
+                        f"turn {turn:.2f}°"
+                    )
+
+        # New anchors: keypoints with a trustworthy depth from nearby tracked landmarks.
+        found, landmarks = map_store.lookup(track_ids_now)
+        if found.sum() < 20:
+            return
+        weights = map_store.lookup_weights(track_ids_now)[found]
+        landmarks = landmarks[weights >= MIN_ANCHOR_LANDMARK_WEIGHT]
+        pixels = track_px[found][weights >= MIN_ANCHOR_LANDMARK_WEIGHT]
+        camera = (landmarks - world_position) @ world_rotation
+        ahead = camera[:, 2] > 0.2
+        depth = keypoint_depths(keypoints, pixels[ahead], camera[ahead, 2], (height, width))
+        valid = np.isfinite(depth)
+        if not valid.any():
+            return
+
+        normalized = np.column_stack([keypoints, np.ones(len(keypoints))]) @ np.linalg.inv(intrinsic).T
+        points = (world_rotation @ (normalized * depth[:, None]).T).T + world_position
+        to_camera = world_position - points
+        to_camera /= np.maximum(np.linalg.norm(to_camera, axis=1, keepdims=True), 1e-9)
+
+        wanted = valid.copy()
+        if len(query):
+            gap = np.linalg.norm(points[query] - anchors.positions[matched], axis=1)
+            same = gap < SAME_POINT_TOL * np.nan_to_num(depth[query], nan=1e9)
+            cos_view = np.einsum("ij,ij->i", to_camera[query], anchors.views[matched])
+            fresh_view = cos_view < np.cos(np.radians(NEW_VIEW_DEG))
+            wanted[query] = valid[query] & same & fresh_view  # known point: only new views
+        candidates = np.flatnonzero(wanted)
+        if len(candidates) > MAX_NEW_ANCHORS:
+            candidates = candidates[np.argsort(-response[candidates])[:MAX_NEW_ANCHORS]]
+        anchors.add(descriptors[candidates], points[candidates], to_camera[candidates], step)
 
     def process_slam_frame(frame: np.ndarray, gray: np.ndarray) -> np.ndarray:
         nonlocal prev_gray, track_points, track_ids, next_track_id, processed
@@ -687,6 +819,9 @@ def main() -> None:
                         intrinsic, rotation, translation, key_inlier, current_inlier
                     )
                     scale = None
+                    map_store.reactivate_in_view(
+                        world_rotation, world_position, intrinsic, width, height
+                    )
                     found, landmarks = map_store.lookup(inlier_ids)
                     if found.sum() >= MIN_SCALE_MATCHES:
                         depth_unit = unit_points[found, 2]
@@ -724,11 +859,51 @@ def main() -> None:
                         np.broadcast_to(world_position, (len(rays_now), 3)),
                         rays_now,
                     )
+                    step = len(trajectory) - 1
                     if usable.any():
                         weights = np.clip(angle_deg[usable] ** 2, 0.01, MAX_OBSERVATION_WEIGHT)
                         colors = sample_colors(frame, current_inlier[usable])
-                        map_store.add(
-                            points_world[usable], colors, inlier_ids[usable], weights
+                        obs_ids = inlier_ids[usable]
+                        obs_points = points_world[usable]
+                        obs_pixels = current_inlier[usable]
+
+                        # Tracks that are new but sit on a landmark we already have
+                        # (e.g. returning to an area) adopt that landmark's id, so
+                        # their observations refine it rather than duplicating it.
+                        known, _ = map_store.lookup(obs_ids)
+                        fresh = np.flatnonzero(~known)
+                        if len(fresh):
+                            hit, target = map_store.find_existing(
+                                obs_points[fresh],
+                                obs_pixels[fresh],
+                                world_rotation,
+                                world_position,
+                                intrinsic,
+                                width,
+                                height,
+                                exclude_ids=good_ids,
+                            )
+                            if hit.any():
+                                source = obs_ids[fresh][hit]
+                                obs_ids = remap_ids(obs_ids, source, target[hit])
+                                inlier_ids = remap_ids(inlier_ids, source, target[hit])
+                                good_ids = remap_ids(good_ids, source, target[hit])
+                                stats["associated"] += int(hit.sum())
+                        map_store.add(obs_points, colors, obs_ids, weights, step, now=video_clock())
+
+                    stats["commits"] += 1
+                    if anchors is not None and stats["commits"] % ANCHOR_INTERVAL == 0:
+                        run_anchor_step(gray, inlier_ids, current_inlier)
+
+                    clock = video_clock()
+                    if args.prune_age > 0 and clock - prune_state["last"] >= PRUNE_INTERVAL_SECONDS:
+                        prune_state["last"] = clock
+                        stats["pruned"] += map_store.prune_isolated(
+                            clock,
+                            np.asarray(trajectory),
+                            args.prune_age,
+                            args.prune_isolation,
+                            check_window=2.0 * PRUNE_INTERVAL_SECONDS,
                         )
 
                     map_store.archive_out_of_walker_view(
