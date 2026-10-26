@@ -252,7 +252,7 @@ def main() -> None:
 
     print(f"Running SLAM on {video_path}")
     print("Video: q = quit, space = pause/resume")
-    print(f"{MAP_WINDOW}: drag to orbit, scroll to dolly (moves camera, not window scale)")
+    print(f"{MAP_WINDOW}: LMB orbit, RMB pan, scroll dolly, Reset button top-left")
 
     while True:
         if not map_view.poll():
