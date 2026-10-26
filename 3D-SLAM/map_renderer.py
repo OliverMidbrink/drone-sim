@@ -7,6 +7,8 @@ import glfw
 import moderngl
 import numpy as np
 
+from map_store import MapStore
+
 MAP_WINDOW = "3D SLAM map (LMB orbit, RMB pan, scroll dolly)"
 
 DEFAULT_YAW = 0.85
@@ -112,8 +114,9 @@ class MapRenderer:
         self._last_cursor = (0.0, 0.0)
 
         self._trajectory: list[np.ndarray] = []
-        self._map_points = np.empty((0, 3), dtype=np.float64)
-        self._map_colors = np.empty((0, 3), dtype=np.float64)
+        self._map_store: MapStore | None = None
+        self._render_points = np.empty((0, 3), dtype=np.float64)
+        self._render_colors = np.empty((0, 3), dtype=np.float64)
 
         self._window = None
         self._ctx: moderngl.Context | None = None
@@ -303,15 +306,9 @@ class MapRenderer:
         glfw.poll_events()
         return not glfw.window_should_close(self._window)
 
-    def show(
-        self,
-        trajectory: list[np.ndarray],
-        map_points: np.ndarray,
-        map_colors: np.ndarray,
-    ) -> None:
+    def show(self, trajectory: list[np.ndarray], map_store: MapStore) -> None:
         self._trajectory = trajectory
-        self._map_points = map_points
-        self._map_colors = map_colors
+        self._map_store = map_store
         self.draw()
 
     def draw(self) -> None:
@@ -319,8 +316,6 @@ class MapRenderer:
             return
 
         traj = np.array(self._trajectory, dtype=np.float64)
-        self._update_focus_and_distance(traj, self._map_points)
-        self._upload_geometry(traj, self._map_points, self._map_colors)
 
         fb_w, fb_h = glfw.get_framebuffer_size(self._window)
         aspect = fb_w / max(fb_h, 1)
@@ -329,6 +324,20 @@ class MapRenderer:
         target = self._target()
         direction = self._orbit_direction()
         eye = target + direction * self.distance
+
+        if self._map_store is not None:
+            self._render_points, self._render_colors = self._map_store.render_subset(
+                eye,
+                target,
+                aspect,
+            )
+        else:
+            self._render_points = np.empty((0, 3), dtype=np.float64)
+            self._render_colors = np.empty((0, 3), dtype=np.float64)
+
+        self._update_focus_and_distance(traj, self._render_points)
+        self._upload_geometry(traj, self._render_points, self._render_colors)
+
         view = _look_at(eye, target, np.array([0.0, 1.0, 0.0]))
 
         mvp = projection @ view

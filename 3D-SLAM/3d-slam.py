@@ -8,10 +8,12 @@ import cv2
 import numpy as np
 
 from map_renderer import MAP_WINDOW, MapRenderer
+from map_store import MapStore
 
 DEFAULT_VIDEO = (
     Path(__file__).resolve().parent / "video-samples" / "forest-walking.mp4"
 )
+DEFAULT_MAP_CACHE = Path(__file__).resolve().parent / ".map-cache"
 
 LK_PARAMS = dict(
     winSize=(21, 21),
@@ -42,12 +44,12 @@ def detect_points(
     mask = np.full(gray.shape, 255, np.uint8)
     if existing is not None and len(existing):
         for x, y in existing.reshape(-1, 2).astype(int):
-            cv2.circle(mask, (int(x), int(y)), 7, 0, -1)
+            cv2.circle(mask, (int(x), int(y)), 5, 0, -1)
     corners = cv2.goodFeaturesToTrack(
         gray,
         maxCorners=max_corners,
-        qualityLevel=0.01,
-        minDistance=7,
+        qualityLevel=0.008,
+        minDistance=4,
         mask=mask,
     )
     if corners is None:
@@ -136,13 +138,10 @@ def transform_points_to_world(
 
 def sample_colors(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
     height, width = image.shape[:2]
-    colors = []
-    for x, y in pixels:
-        xi = int(np.clip(round(x), 0, width - 1))
-        yi = int(np.clip(round(y), 0, height - 1))
-        bgr = image[yi, xi]
-        colors.append((bgr[2], bgr[1], bgr[0]))
-    return np.array(colors, dtype=np.float64) / 255.0
+    xi = np.clip(np.round(pixels[:, 0]).astype(int), 0, width - 1)
+    yi = np.clip(np.round(pixels[:, 1]).astype(int), 0, height - 1)
+    bgr = image[yi, xi]
+    return bgr[:, ::-1].astype(np.float64) / 255.0
 
 
 def draw_tracks(image: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -185,14 +184,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-features",
         type=int,
-        default=700,
-        help="target number of tracked features (default: 700)",
+        default=2000,
+        help="target tracked features per frame (default: 2000)",
     )
     parser.add_argument(
-        "--max-map-points",
+        "--max-live-points",
         type=int,
-        default=25000,
-        help="cap on stored map points (default: 25000)",
+        default=50_000,
+        help="max landmarks kept in active RAM (default: 50000)",
+    )
+    parser.add_argument(
+        "--ram-archive-limit",
+        type=int,
+        default=120_000,
+        help="max archived landmarks in RAM before disk flush (default: 120000)",
+    )
+    parser.add_argument(
+        "--map-cache",
+        type=Path,
+        default=DEFAULT_MAP_CACHE,
+        help="directory for archived landmark chunks (default: 3D-SLAM/.map-cache)",
+    )
+    parser.add_argument(
+        "--no-disk-cache",
+        action="store_true",
+        help="keep archive in RAM only (trim when full)",
     )
     parser.add_argument(
         "--plot-every",
@@ -237,14 +253,18 @@ def main() -> None:
     world_position = np.zeros(3, dtype=np.float64)
     trajectory = [world_position.copy()]
 
-    map_points = np.empty((0, 3), dtype=np.float64)
-    map_colors = np.empty((0, 3), dtype=np.float64)
+    cache_dir = None if args.no_disk_cache else args.map_cache.expanduser().resolve()
+    map_store = MapStore(
+        cache_dir=cache_dir,
+        ram_archive_limit=args.ram_archive_limit,
+        max_live_points=args.max_live_points,
+    )
 
     map_height = max(320, height // 2)
     map_view = MapRenderer(width, map_height)
     map_view.setup_window()
     layout_windows(width, height, map_height)
-    map_view.show(trajectory, map_points, map_colors)
+    map_view.show(trajectory, map_store)
 
     frame_index = 0
     processed = 0
@@ -253,135 +273,144 @@ def main() -> None:
     print(f"Running SLAM on {video_path}")
     print("Video: q = quit, space = pause/resume")
     print(f"{MAP_WINDOW}: LMB orbit, RMB pan, scroll dolly, Reset button top-left")
+    print(
+        f"Map: up to {args.max_features} tracks, live cap {args.max_live_points}, "
+        f"archive flush to {cache_dir or 'RAM trim only'}"
+    )
 
-    while True:
-        if not map_view.poll():
-            break
-
-        if not paused:
-            ok, frame = capture.read()
-            if not ok:
-                print("End of video.")
+    try:
+        while True:
+            if not map_view.poll():
                 break
 
-            frame_index += 1
-            if frame_index % args.stride != 0:
-                continue
+            if not paused:
+                ok, frame = capture.read()
+                if not ok:
+                    print("End of video.")
+                    break
 
-            if args.scale != 1.0:
-                frame = cv2.resize(
-                    frame,
+                frame_index += 1
+                if frame_index % args.stride != 0:
+                    continue
+
+                if args.scale != 1.0:
+                    frame = cv2.resize(
+                        frame,
+                        None,
+                        fx=args.scale,
+                        fy=args.scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                if len(track_points) < 8:
+                    track_points = detect_points(gray, None, args.max_features)
+                    prev_gray = gray
+                    processed += 1
+                    cv2.imshow(TRACK_WINDOW, draw_tracks(frame, track_points))
+                    if processed % args.plot_every == 0:
+                        map_view.show(trajectory, map_store)
+                    continue
+
+                next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+                    prev_gray,
+                    gray,
+                    track_points,
                     None,
-                    fx=args.scale,
-                    fy=args.scale,
-                    interpolation=cv2.INTER_AREA,
+                    **LK_PARAMS,
                 )
+                status = status.reshape(-1)
+                good_previous = track_points[status == 1]
+                good_current = next_points[status == 1]
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                motion = estimate_motion(good_previous, good_current, intrinsic)
+                if motion is not None:
+                    rotation, translation, inliers = motion
+                    previous_inlier = good_previous[inliers].reshape(-1, 2)
+                    current_inlier = good_current[inliers].reshape(-1, 2)
 
-            if len(track_points) < 8:
-                track_points = detect_points(gray, None, args.max_features)
-                prev_gray = gray
-                processed += 1
-                cv2.imshow(TRACK_WINDOW, draw_tracks(frame, track_points))
-                if processed % args.plot_every == 0:
-                    map_view.show(trajectory, map_points, map_colors)
-                continue
+                    points_cam = triangulate_pair(
+                        intrinsic,
+                        rotation,
+                        translation,
+                        previous_inlier,
+                        current_inlier,
+                    )
+                    valid = points_cam[:, 2] > 0.1
+                    points_cam = points_cam[valid]
+                    current_inlier = current_inlier[valid]
 
-            next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-                prev_gray,
-                gray,
-                track_points,
-                None,
-                **LK_PARAMS,
-            )
-            status = status.reshape(-1)
-            good_previous = track_points[status == 1]
-            good_current = next_points[status == 1]
+                    scale = triangulation_scale(points_cam)
+                    translation = translation.reshape(3) * scale
+                    points_cam *= scale
 
-            motion = estimate_motion(good_previous, good_current, intrinsic)
-            if motion is not None:
-                rotation, translation, inliers = motion
-                previous_inlier = good_previous[inliers].reshape(-1, 2)
-                current_inlier = good_current[inliers].reshape(-1, 2)
+                    if len(points_cam) > 0:
+                        world_points = transform_points_to_world(
+                            points_cam,
+                            world_rotation,
+                            world_position,
+                        )
+                        colors = sample_colors(frame, current_inlier)
+                        map_store.add(world_points, colors)
 
-                points_cam = triangulate_pair(
-                    intrinsic,
-                    rotation,
-                    translation,
-                    previous_inlier,
-                    current_inlier,
-                )
-                valid = points_cam[:, 2] > 0.1
-                points_cam = points_cam[valid]
-                current_inlier = current_inlier[valid]
+                    world_position = world_position + world_rotation @ translation
+                    world_rotation = world_rotation @ rotation
+                    trajectory.append(world_position.copy())
 
-                scale = triangulation_scale(points_cam)
-                translation = translation.reshape(3) * scale
-                points_cam *= scale
-
-                if len(points_cam) > 0:
-                    world_points = transform_points_to_world(
-                        points_cam,
+                    map_store.archive_out_of_walker_view(
                         world_rotation,
                         world_position,
+                        intrinsic,
+                        width,
+                        height,
                     )
-                    colors = sample_colors(frame, current_inlier)
-                    map_points = np.vstack([map_points, world_points])
-                    map_colors = np.vstack([map_colors, colors])
 
-                    if len(map_points) > args.max_map_points:
-                        keep = np.random.choice(
-                            len(map_points),
-                            args.max_map_points,
-                            replace=False,
-                        )
-                        map_points = map_points[keep]
-                        map_colors = map_colors[keep]
+                track_points = good_current.reshape(-1, 1, 2)
+                if len(track_points) < args.max_features // 2:
+                    fresh = detect_points(
+                        gray,
+                        track_points.reshape(-1, 2),
+                        args.max_features - len(track_points),
+                    )
+                    track_points = merge_points(track_points, fresh)
 
-                world_position = world_position + world_rotation @ translation
-                world_rotation = world_rotation @ rotation
-                trajectory.append(world_position.copy())
+                prev_gray = gray
+                processed += 1
 
-            track_points = good_current.reshape(-1, 1, 2)
-            if len(track_points) < args.max_features // 2:
-                fresh = detect_points(
-                    gray,
-                    track_points.reshape(-1, 2),
-                    args.max_features - len(track_points),
+                vis = draw_tracks(frame, track_points)
+                cv2.putText(
+                    vis,
+                    (
+                        f"poses: {len(trajectory)}  "
+                        f"live: {map_store.live_count}  "
+                        f"stored: {map_store.archive_count}  "
+                        f"total: {len(map_store)}"
+                    ),
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2,
                 )
-                track_points = merge_points(track_points, fresh)
+                cv2.imshow(TRACK_WINDOW, vis)
 
-            prev_gray = gray
-            processed += 1
+                if processed % args.plot_every == 0:
+                    map_view.show(trajectory, map_store)
 
-            vis = draw_tracks(frame, track_points)
-            cv2.putText(
-                vis,
-                f"poses: {len(trajectory)}  map: {len(map_points)}",
-                (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-            )
-            cv2.imshow(TRACK_WINDOW, vis)
-
-            if processed % args.plot_every == 0:
-                map_view.show(trajectory, map_points, map_colors)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        if key == ord(" "):
-            paused = not paused
-
-    capture.release()
-    map_view.show(trajectory, map_points, map_colors)
-    print("Finished. Press a key in a video window to exit.")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-    map_view.close()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord(" "):
+                paused = not paused
+    finally:
+        capture.release()
+        map_store.finalize()
+        map_view.show(trajectory, map_store)
+        print("Finished. Press a key in a video window to exit.")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        map_view.close()
 
 
 if __name__ == "__main__":
