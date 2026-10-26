@@ -5,11 +5,9 @@ import argparse
 from pathlib import Path
 
 import cv2
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
+
+from map_renderer import MAP_WINDOW, MapRenderer
 
 DEFAULT_VIDEO = (
     Path(__file__).resolve().parent / "video-samples" / "forest-walking.mp4"
@@ -20,6 +18,8 @@ LK_PARAMS = dict(
     maxLevel=3,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
 )
+
+TRACK_WINDOW = "SLAM tracks"
 
 
 def camera_matrix(width: int, height: int) -> np.ndarray:
@@ -152,78 +152,13 @@ def draw_tracks(image: np.ndarray, points: np.ndarray) -> np.ndarray:
     return vis
 
 
-MAP_WINDOW = "3D SLAM map"
-TRACK_WINDOW = "SLAM tracks"
-
-
 def layout_windows(video_width: int, video_height: int, map_height: int) -> None:
     margin_x = 40
     margin_y = 40
     title_bar = 32
-    cv2.namedWindow(MAP_WINDOW, cv2.WINDOW_NORMAL)
     cv2.namedWindow(TRACK_WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(MAP_WINDOW, video_width, map_height)
     cv2.resizeWindow(TRACK_WINDOW, video_width, video_height)
-    cv2.moveWindow(MAP_WINDOW, margin_x, margin_y)
     cv2.moveWindow(TRACK_WINDOW, margin_x, margin_y + map_height + title_bar)
-
-
-def update_map_plot(
-    axis,
-    trajectory: np.ndarray,
-    map_points: np.ndarray,
-    map_colors: np.ndarray,
-) -> None:
-    axis.cla()
-    axis.set_xlabel("X")
-    axis.set_ylabel("Y")
-    axis.set_zlabel("Z")
-    axis.set_title("Sparse map (proportions only)")
-    if len(map_points) > 0:
-        axis.scatter(
-            map_points[:, 0],
-            map_points[:, 1],
-            map_points[:, 2],
-            c=map_colors,
-            s=1,
-            alpha=0.6,
-        )
-    if len(trajectory) > 0:
-        axis.plot(
-            trajectory[:, 0],
-            trajectory[:, 1],
-            trajectory[:, 2],
-            color="cyan",
-            linewidth=2,
-            label="camera path",
-        )
-        axis.legend(loc="upper right")
-    set_equal_axis_limits(axis, trajectory, map_points)
-    axis.view_init(elev=22, azim=-62)
-
-
-def render_map_to_bgr(figure, axis, width: int, height: int) -> np.ndarray:
-    figure.canvas.draw()
-    rgba = np.asarray(figure.canvas.buffer_rgba())
-    bgr = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR)
-    if bgr.shape[1] != width or bgr.shape[0] != height:
-        bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
-    return bgr
-
-
-def show_map(
-    figure,
-    axis,
-    trajectory: list[np.ndarray],
-    map_points: np.ndarray,
-    map_colors: np.ndarray,
-    width: int,
-    map_height: int,
-) -> None:
-    traj = np.array(trajectory)
-    update_map_plot(axis, traj, map_points, map_colors)
-    map_view = render_map_to_bgr(figure, axis, width, map_height)
-    cv2.imshow(MAP_WINDOW, map_view)
 
 
 def parse_args() -> argparse.Namespace:
@@ -263,7 +198,7 @@ def parse_args() -> argparse.Namespace:
         "--plot-every",
         type=int,
         default=3,
-        help="refresh 3D plot every N processed frames (default: 3)",
+        help="refresh 3D map every N processed frames (default: 3)",
     )
     return parser.parse_args()
 
@@ -306,20 +241,23 @@ def main() -> None:
     map_colors = np.empty((0, 3), dtype=np.float64)
 
     map_height = max(320, height // 2)
-    figure = plt.figure(figsize=(width / 100, map_height / 100), dpi=100)
-    axis = figure.add_subplot(111, projection="3d")
-    figure.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.95)
+    map_view = MapRenderer(width, map_height)
+    map_view.setup_window()
     layout_windows(width, height, map_height)
-    show_map(figure, axis, trajectory, map_points, map_colors, width, map_height)
+    map_view.show(trajectory, map_points, map_colors)
 
     frame_index = 0
     processed = 0
     paused = False
 
     print(f"Running SLAM on {video_path}")
-    print("Controls: q = quit, space = pause/resume")
+    print("Video: q = quit, space = pause/resume")
+    print(f"{MAP_WINDOW}: drag to orbit, scroll to dolly (moves camera, not window scale)")
 
     while True:
+        if not map_view.poll():
+            break
+
         if not paused:
             ok, frame = capture.read()
             if not ok:
@@ -347,15 +285,7 @@ def main() -> None:
                 processed += 1
                 cv2.imshow(TRACK_WINDOW, draw_tracks(frame, track_points))
                 if processed % args.plot_every == 0:
-                    show_map(
-                        figure,
-                        axis,
-                        trajectory,
-                        map_points,
-                        map_colors,
-                        width,
-                        map_height,
-                    )
+                    map_view.show(trajectory, map_points, map_colors)
                 continue
 
             next_points, status, _ = cv2.calcOpticalFlowPyrLK(
@@ -438,15 +368,7 @@ def main() -> None:
             cv2.imshow(TRACK_WINDOW, vis)
 
             if processed % args.plot_every == 0:
-                show_map(
-                    figure,
-                    axis,
-                    trajectory,
-                    map_points,
-                    map_colors,
-                    width,
-                    map_height,
-                )
+                map_view.show(trajectory, map_points, map_colors)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -455,31 +377,11 @@ def main() -> None:
             paused = not paused
 
     capture.release()
-    show_map(
-        figure,
-        axis,
-        trajectory,
-        map_points,
-        map_colors,
-        width,
-        map_height,
-    )
-    print("Finished. Press any key in a video window to exit.")
+    map_view.show(trajectory, map_points, map_colors)
+    print("Finished. Press a key in a video window to exit.")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
-    plt.close(figure)
-
-
-def set_equal_axis_limits(axis, trajectory: np.ndarray, points: np.ndarray) -> None:
-    if len(trajectory) == 0 and len(points) == 0:
-        return
-    samples = trajectory if len(points) == 0 else np.vstack([trajectory, points])
-    center = samples.mean(axis=0)
-    radius = np.max(np.linalg.norm(samples - center, axis=1))
-    radius = max(radius, 0.5)
-    axis.set_xlim(center[0] - radius, center[0] + radius)
-    axis.set_ylim(center[1] - radius, center[1] + radius)
-    axis.set_zlim(center[2] - radius, center[2] + radius)
+    map_view.close()
 
 
 if __name__ == "__main__":

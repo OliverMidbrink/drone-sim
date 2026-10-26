@@ -1,3 +1,4 @@
-matplotlib
+glfw
+moderngl
 numpy
 opencv-python
