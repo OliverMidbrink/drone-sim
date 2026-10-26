@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import time
+
 import cv2
 import glfw
 import moderngl
 import numpy as np
 
+from map_store import MapStore
+
 MAP_WINDOW = "3D SLAM map (LMB orbit, RMB pan, scroll dolly)"
+
+INTRO_FOLLOW_SECONDS = 3.0
 
 DEFAULT_YAW = 0.85
 DEFAULT_PITCH = -0.38
@@ -106,14 +112,16 @@ class MapRenderer:
         self.pan = np.zeros(3, dtype=np.float64)
         self.focus = np.zeros(3, dtype=np.float64)
         self._user_camera = False
-        self._framed = False
+        self._intro_start: float | None = None
+        self._follow_released = False
         self._orbit_drag = False
         self._pan_drag = False
         self._last_cursor = (0.0, 0.0)
 
         self._trajectory: list[np.ndarray] = []
-        self._map_points = np.empty((0, 3), dtype=np.float64)
-        self._map_colors = np.empty((0, 3), dtype=np.float64)
+        self._map_store: MapStore | None = None
+        self._render_points = np.empty((0, 3), dtype=np.float64)
+        self._render_colors = np.empty((0, 3), dtype=np.float64)
 
         self._window = None
         self._ctx: moderngl.Context | None = None
@@ -168,6 +176,7 @@ class MapRenderer:
 
         fb_w, fb_h = glfw.get_framebuffer_size(self._window)
         self._ctx.viewport = (0, 0, fb_w, fb_h)
+        self._intro_start = time.monotonic()
 
     def _setup_reset_button(self) -> None:
         assert self._ctx is not None
@@ -246,7 +255,8 @@ class MapRenderer:
         self.pitch = DEFAULT_PITCH
         self.pan[:] = 0.0
         self._user_camera = False
-        self._framed = False
+        self._follow_released = False
+        self._intro_start = time.monotonic()
 
     def _on_resize(self, _window, width: int, height: int) -> None:
         if self._ctx is not None and height > 0:
@@ -303,15 +313,9 @@ class MapRenderer:
         glfw.poll_events()
         return not glfw.window_should_close(self._window)
 
-    def show(
-        self,
-        trajectory: list[np.ndarray],
-        map_points: np.ndarray,
-        map_colors: np.ndarray,
-    ) -> None:
+    def show(self, trajectory: list[np.ndarray], map_store: MapStore) -> None:
         self._trajectory = trajectory
-        self._map_points = map_points
-        self._map_colors = map_colors
+        self._map_store = map_store
         self.draw()
 
     def draw(self) -> None:
@@ -319,8 +323,6 @@ class MapRenderer:
             return
 
         traj = np.array(self._trajectory, dtype=np.float64)
-        self._update_focus_and_distance(traj, self._map_points)
-        self._upload_geometry(traj, self._map_points, self._map_colors)
 
         fb_w, fb_h = glfw.get_framebuffer_size(self._window)
         aspect = fb_w / max(fb_h, 1)
@@ -329,6 +331,20 @@ class MapRenderer:
         target = self._target()
         direction = self._orbit_direction()
         eye = target + direction * self.distance
+
+        if self._map_store is not None:
+            self._render_points, self._render_colors = self._map_store.render_subset(
+                eye,
+                target,
+                aspect,
+            )
+        else:
+            self._render_points = np.empty((0, 3), dtype=np.float64)
+            self._render_colors = np.empty((0, 3), dtype=np.float64)
+
+        self._update_focus_and_distance(traj, self._render_points)
+        self._upload_geometry(traj, self._render_points, self._render_colors)
+
         view = _look_at(eye, target, np.array([0.0, 1.0, 0.0]))
 
         mvp = projection @ view
@@ -424,6 +440,14 @@ class MapRenderer:
     def _update_focus_and_distance(
         self, trajectory: np.ndarray, map_points: np.ndarray
     ) -> None:
+        if self._follow_released:
+            return
+        if self._intro_start is None:
+            return
+        if time.monotonic() - self._intro_start >= INTRO_FOLLOW_SECONDS:
+            self._follow_released = True
+            return
+
         if len(trajectory) == 0 and len(map_points) == 0:
             return
 
@@ -444,9 +468,7 @@ class MapRenderer:
 
         radius = float(np.max(np.linalg.norm(samples - self.focus, axis=1)))
         radius = max(radius, 0.5)
-        if not self._framed:
-            self.distance = max(1.5, radius * 2.2)
-            self._framed = True
+        self.distance = max(1.5, radius * 2.2)
 
     def close(self) -> None:
         if self._point_vbo is not None:

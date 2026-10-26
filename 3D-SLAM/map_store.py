@@ -1,0 +1,288 @@
+"""Tiered landmark storage: live (in view), RAM archive, optional disk cache."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+
+def _empty_points() -> np.ndarray:
+    return np.empty((0, 3), dtype=np.float64)
+
+
+def _empty_colors() -> np.ndarray:
+    return np.empty((0, 3), dtype=np.float64)
+
+
+def visible_from_camera(
+    points_world: np.ndarray,
+    world_rotation: np.ndarray,
+    world_position: np.ndarray,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    margin_ratio: float = 0.2,
+) -> np.ndarray:
+    if len(points_world) == 0:
+        return np.zeros(0, dtype=bool)
+
+    relative = points_world - world_position
+    camera = relative @ world_rotation
+
+    depth = camera[:, 2]
+    in_front = depth > 0.15
+
+    safe_z = np.maximum(depth, 1e-6)
+    u = intrinsic[0, 0] * camera[:, 0] / safe_z + intrinsic[0, 2]
+    v = intrinsic[1, 1] * camera[:, 1] / safe_z + intrinsic[1, 2]
+
+    margin_x = width * margin_ratio
+    margin_y = height * margin_ratio
+    in_frame = (
+        (u >= -margin_x)
+        & (u <= width + margin_x)
+        & (v >= -margin_y)
+        & (v <= height + margin_y)
+    )
+    return in_front & in_frame
+
+
+def visible_from_orbit(
+    points_world: np.ndarray,
+    eye: np.ndarray,
+    target: np.ndarray,
+    fov_y_deg: float = 45.0,
+    aspect: float = 1.0,
+    *,
+    margin: float = 0.25,
+) -> np.ndarray:
+    if len(points_world) == 0:
+        return np.zeros(0, dtype=bool)
+
+    forward = target - eye
+    forward /= np.linalg.norm(forward)
+    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    right = np.cross(forward, world_up)
+    norm = np.linalg.norm(right)
+    if norm < 1e-8:
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        right = np.cross(forward, world_up)
+        right /= np.linalg.norm(right)
+    else:
+        right /= norm
+    up = np.cross(right, forward)
+
+    vectors = points_world - eye
+    depth = vectors @ forward
+    in_front = depth > 0.05
+
+    half_h = np.tan(np.radians(fov_y_deg) / 2.0) * (1.0 + margin)
+    half_w = half_h * aspect
+
+    lateral = vectors @ right
+    vertical = vectors @ up
+    safe_depth = np.maximum(depth, 1e-6)
+    in_frustum = (np.abs(lateral / safe_depth) <= half_w) & (
+        np.abs(vertical / safe_depth) <= half_h
+    )
+    return in_front & in_frustum
+
+
+class MapStore:
+    def __init__(
+        self,
+        cache_dir: Path | None,
+        ram_archive_limit: int = 120_000,
+        max_live_points: int = 50_000,
+    ) -> None:
+        self.cache_dir = cache_dir
+        self.ram_archive_limit = ram_archive_limit
+        self.max_live_points = max_live_points
+
+        self.live_positions = _empty_points()
+        self.live_colors = _empty_colors()
+        self.archive_positions = _empty_points()
+        self.archive_colors = _empty_colors()
+        self.disk_point_count = 0
+        self._chunk_id = 0
+        self._disk_positions = _empty_points()
+        self._disk_colors = _empty_colors()
+        self._disk_chunks_loaded = 0
+
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def __len__(self) -> int:
+        return (
+            len(self.live_positions)
+            + len(self.archive_positions)
+            + self.disk_point_count
+        )
+
+    @property
+    def live_count(self) -> int:
+        return len(self.live_positions)
+
+    @property
+    def archive_count(self) -> int:
+        return len(self.archive_positions) + self.disk_point_count
+
+    def add(
+        self,
+        world_points: np.ndarray,
+        colors: np.ndarray,
+    ) -> None:
+        if len(world_points) == 0:
+            return
+        self.live_positions = np.vstack([self.live_positions, world_points])
+        self.live_colors = np.vstack([self.live_colors, colors])
+
+        if len(self.live_positions) > self.max_live_points:
+            overflow = len(self.live_positions) - self.max_live_points
+            self._move_to_archive(self.live_positions[:overflow], self.live_colors[:overflow])
+            self.live_positions = self.live_positions[overflow:]
+            self.live_colors = self.live_colors[overflow:]
+
+    def archive_out_of_walker_view(
+        self,
+        world_rotation: np.ndarray,
+        world_position: np.ndarray,
+        intrinsic: np.ndarray,
+        width: int,
+        height: int,
+    ) -> int:
+        if len(self.live_positions) == 0:
+            return 0
+
+        visible = visible_from_camera(
+            self.live_positions,
+            world_rotation,
+            world_position,
+            intrinsic,
+            width,
+            height,
+        )
+        if visible.all():
+            return 0
+
+        archived = self.live_positions[~visible]
+        archived_colors = self.live_colors[~visible]
+        self._move_to_archive(archived, archived_colors)
+
+        self.live_positions = self.live_positions[visible]
+        self.live_colors = self.live_colors[visible]
+        return len(archived)
+
+    def _move_to_archive(
+        self,
+        positions: np.ndarray,
+        colors: np.ndarray,
+    ) -> None:
+        if len(positions) == 0:
+            return
+        self.archive_positions = np.vstack([self.archive_positions, positions])
+        self.archive_colors = np.vstack([self.archive_colors, colors])
+
+        if len(self.archive_positions) > self.ram_archive_limit:
+            self.flush_archive_to_disk()
+
+    def flush_archive_to_disk(self) -> None:
+        if len(self.archive_positions) == 0:
+            return
+        if self.cache_dir is None:
+            # No disk cache: drop oldest half of RAM archive to bound memory.
+            keep = len(self.archive_positions) // 2
+            self.archive_positions = self.archive_positions[keep:]
+            self.archive_colors = self.archive_colors[keep:]
+            return
+
+        path = self.cache_dir / f"chunk_{self._chunk_id:05d}.npz"
+        np.savez_compressed(
+            path,
+            positions=self.archive_positions.astype(np.float32),
+            colors=self.archive_colors.astype(np.float32),
+        )
+        self.disk_point_count += len(self.archive_positions)
+        self._chunk_id += 1
+        self.archive_positions = _empty_points()
+        self.archive_colors = _empty_colors()
+        self._disk_chunks_loaded = -1  # invalidate GPU-side disk cache
+
+    def _sync_disk_cache_for_render(self) -> None:
+        if self.cache_dir is None or self._chunk_id == 0:
+            return
+        if self._disk_chunks_loaded == self._chunk_id:
+            return
+
+        positions_list: list[np.ndarray] = []
+        colors_list: list[np.ndarray] = []
+        for chunk_index in range(self._chunk_id):
+            path = self.cache_dir / f"chunk_{chunk_index:05d}.npz"
+            if not path.is_file():
+                continue
+            data = np.load(path)
+            positions_list.append(data["positions"].astype(np.float64))
+            colors_list.append(data["colors"].astype(np.float64))
+
+        if positions_list:
+            self._disk_positions = np.vstack(positions_list)
+            self._disk_colors = np.vstack(colors_list)
+        else:
+            self._disk_positions = _empty_points()
+            self._disk_colors = _empty_colors()
+        self._disk_chunks_loaded = self._chunk_id
+
+    def render_subset(
+        self,
+        eye: np.ndarray,
+        target: np.ndarray,
+        aspect: float,
+        *,
+        max_points: int = 80_000,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Points to upload to the GPU for the current orbit view."""
+        blocks: list[np.ndarray] = []
+        color_blocks: list[np.ndarray] = []
+
+        if len(self.live_positions) > 0:
+            live_mask = visible_from_orbit(
+                self.live_positions, eye, target, aspect=aspect
+            )
+            if live_mask.any():
+                blocks.append(self.live_positions[live_mask])
+                color_blocks.append(self.live_colors[live_mask])
+
+        if len(self.archive_positions) > 0:
+            archive_mask = visible_from_orbit(
+                self.archive_positions, eye, target, aspect=aspect
+            )
+            if archive_mask.any():
+                blocks.append(self.archive_positions[archive_mask])
+                color_blocks.append(self.archive_colors[archive_mask])
+
+        self._sync_disk_cache_for_render()
+        if len(self._disk_positions) > 0:
+            disk_mask = visible_from_orbit(
+                self._disk_positions, eye, target, aspect=aspect
+            )
+            if disk_mask.any():
+                blocks.append(self._disk_positions[disk_mask])
+                color_blocks.append(self._disk_colors[disk_mask])
+
+        if not blocks:
+            return _empty_points(), _empty_colors()
+
+        positions = np.vstack(blocks)
+        colors = np.vstack(color_blocks)
+
+        if len(positions) > max_points:
+            step = max(1, len(positions) // max_points)
+            positions = positions[::step]
+            colors = colors[::step]
+
+        return positions, colors
+
+    def finalize(self) -> None:
+        self.flush_archive_to_disk()

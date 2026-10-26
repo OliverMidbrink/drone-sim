@@ -9,10 +9,12 @@ import cv2
 import numpy as np
 
 from map_renderer import MAP_WINDOW, MapRenderer
+from map_store import MapStore
 
 DEFAULT_VIDEO = (
     Path(__file__).resolve().parent / "video-samples" / "forest-walking.mp4"
 )
+DEFAULT_MAP_CACHE = Path(__file__).resolve().parent / ".map-cache"
 
 LK_PARAMS = dict(
     winSize=(21, 21),
@@ -108,8 +110,11 @@ def transport_hit(
     return None
 
 
-def camera_matrix(width: int, height: int) -> np.ndarray:
-    focal = 0.9 * width
+def camera_matrix(width: int, height: int, fov_deg: float | None = None) -> np.ndarray:
+    if fov_deg is None:
+        focal = 0.9 * width
+    else:
+        focal = width / (2.0 * np.tan(np.radians(fov_deg) / 2.0))
     return np.array(
         [
             [focal, 0.0, width / 2.0],
@@ -128,12 +133,12 @@ def detect_points(
     mask = np.full(gray.shape, 255, np.uint8)
     if existing is not None and len(existing):
         for x, y in existing.reshape(-1, 2).astype(int):
-            cv2.circle(mask, (int(x), int(y)), 7, 0, -1)
+            cv2.circle(mask, (int(x), int(y)), 5, 0, -1)
     corners = cv2.goodFeaturesToTrack(
         gray,
         maxCorners=max_corners,
-        qualityLevel=0.01,
-        minDistance=7,
+        qualityLevel=0.008,
+        minDistance=4,
         mask=mask,
     )
     if corners is None:
@@ -222,13 +227,10 @@ def transform_points_to_world(
 
 def sample_colors(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
     height, width = image.shape[:2]
-    colors = []
-    for x, y in pixels:
-        xi = int(np.clip(round(x), 0, width - 1))
-        yi = int(np.clip(round(y), 0, height - 1))
-        bgr = image[yi, xi]
-        colors.append((bgr[2], bgr[1], bgr[0]))
-    return np.array(colors, dtype=np.float64) / 255.0
+    xi = np.clip(np.round(pixels[:, 0]).astype(int), 0, width - 1)
+    yi = np.clip(np.round(pixels[:, 1]).astype(int), 0, height - 1)
+    bgr = image[yi, xi]
+    return bgr[:, ::-1].astype(np.float64) / 255.0
 
 
 def draw_tracks(image: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -275,6 +277,19 @@ def parse_args() -> argparse.Namespace:
         help="resize factor for processing (default: 0.5)",
     )
     parser.add_argument(
+        "--fov-deg",
+        type=float,
+        default=50.0,
+        metavar="DEG",
+        help="horizontal field of view in degrees (default: 50)",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="stop video after this many seconds (default: 0 = full video)",
+    )
+    parser.add_argument(
         "--stride",
         type=int,
         default=1,
@@ -283,14 +298,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-features",
         type=int,
-        default=700,
-        help="target number of tracked features (default: 700)",
+        default=2000,
+        help="target tracked features per frame (default: 2000)",
     )
     parser.add_argument(
-        "--max-map-points",
+        "--max-live-points",
         type=int,
-        default=25000,
-        help="cap on stored map points (default: 25000)",
+        default=50_000,
+        help="max landmarks kept in active RAM (default: 50000)",
+    )
+    parser.add_argument(
+        "--ram-archive-limit",
+        type=int,
+        default=120_000,
+        help="max archived landmarks in RAM before disk flush (default: 120000)",
+    )
+    parser.add_argument(
+        "--map-cache",
+        type=Path,
+        default=DEFAULT_MAP_CACHE,
+        help="directory for archived landmark chunks (default: 3D-SLAM/.map-cache)",
+    )
+    parser.add_argument(
+        "--no-disk-cache",
+        action="store_true",
+        help="keep archive in RAM only (trim when full)",
     )
     parser.add_argument(
         "--plot-every",
@@ -325,7 +357,9 @@ def main() -> None:
         )
 
     height, width = frame.shape[:2]
-    intrinsic = camera_matrix(width, height)
+    intrinsic = camera_matrix(width, height, args.fov_deg)
+    fx = intrinsic[0, 0]
+    print(f"Camera intrinsics: horizontal FOV {args.fov_deg:g}° -> fx={fx:.1f}px")
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     prev_gray = gray
@@ -335,14 +369,18 @@ def main() -> None:
     world_position = np.zeros(3, dtype=np.float64)
     trajectory = [world_position.copy()]
 
-    map_points = np.empty((0, 3), dtype=np.float64)
-    map_colors = np.empty((0, 3), dtype=np.float64)
+    cache_dir = None if args.no_disk_cache else args.map_cache.expanduser().resolve()
+    map_store = MapStore(
+        cache_dir=cache_dir,
+        ram_archive_limit=args.ram_archive_limit,
+        max_live_points=args.max_live_points,
+    )
 
     map_height = max(320, height // 2)
     map_view = MapRenderer(width, map_height)
     map_view.setup_window()
     layout_windows(width, height, map_height)
-    map_view.show(trajectory, map_points, map_colors)
+    map_view.show(trajectory, map_store)
 
     frame_index = 0
     processed = 0
@@ -352,12 +390,17 @@ def main() -> None:
     play_delay_ms = max(1, int(round(1000.0 / video_fps)))
     button_regions: list[tuple[PlaybackMode, int, int, int, int]] = []
     video_panel_height = height
+    video_active = True
+    map_finalized = False
 
     def hud_lines() -> list[str]:
         t_sec = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        mode_label = playback_mode.name.lower()
+        mode_label = playback_mode.name.lower() if video_active else "map only"
         return [
-            f"poses: {len(trajectory)}  map: {len(map_points)}",
+            (
+                f"poses: {len(trajectory)}  live: {map_store.live_count}  "
+                f"stored: {map_store.archive_count}  total: {len(map_store)}"
+            ),
             f"time: {t_sec:.1f}s  frame: {int(capture.get(cv2.CAP_PROP_POS_FRAMES))}  ({mode_label})",
         ]
 
@@ -377,16 +420,33 @@ def main() -> None:
             return False, None
         return True, resize_frame(raw, args.scale)
 
+    def stop_video_playback() -> None:
+        nonlocal video_active, map_finalized, playback_mode
+        if not video_active:
+            return
+        video_active = False
+        playback_mode = PlaybackMode.PAUSED
+        if capture.isOpened():
+            capture.release()
+        cv2.destroyAllWindows()
+        map_store.finalize()
+        map_finalized = True
+        map_view.show(trajectory, map_store)
+        print(
+            "Video stopped. Explore the 3D map "
+            "(close the map window when finished)."
+        )
+
     def process_slam_frame(frame: np.ndarray, gray: np.ndarray) -> np.ndarray:
         nonlocal prev_gray, track_points, processed
-        nonlocal world_rotation, world_position, trajectory, map_points, map_colors
+        nonlocal world_rotation, world_position, trajectory
 
         if len(track_points) < 8:
             track_points = detect_points(gray, None, args.max_features)
             prev_gray = gray
             processed += 1
             if processed % args.plot_every == 0:
-                map_view.show(trajectory, map_points, map_colors)
+                map_view.show(trajectory, map_store)
             return draw_tracks(frame, track_points)
 
         next_points, status, _ = cv2.calcOpticalFlowPyrLK(
@@ -418,7 +478,7 @@ def main() -> None:
             current_inlier = current_inlier[valid]
 
             scale = triangulation_scale(points_cam)
-            translation = translation.reshape(3) * scale
+            translation_scaled = translation.reshape(3) * scale
             points_cam *= scale
 
             if len(points_cam) > 0:
@@ -428,21 +488,20 @@ def main() -> None:
                     world_position,
                 )
                 colors = sample_colors(frame, current_inlier)
-                map_points = np.vstack([map_points, world_points])
-                map_colors = np.vstack([map_colors, colors])
+                map_store.add(world_points, colors)
 
-                if len(map_points) > args.max_map_points:
-                    keep = np.random.choice(
-                        len(map_points),
-                        args.max_map_points,
-                        replace=False,
-                    )
-                    map_points = map_points[keep]
-                    map_colors = map_colors[keep]
-
-            world_position = world_position + world_rotation @ translation
-            world_rotation = world_rotation @ rotation
+            camera_delta = -(rotation.T @ translation_scaled)
+            world_position = world_position + world_rotation @ camera_delta
+            world_rotation = world_rotation @ rotation.T
             trajectory.append(world_position.copy())
+
+            map_store.archive_out_of_walker_view(
+                world_rotation,
+                world_position,
+                intrinsic,
+                width,
+                height,
+            )
 
         track_points = good_current.reshape(-1, 1, 2)
         if len(track_points) < args.max_features // 2:
@@ -456,7 +515,7 @@ def main() -> None:
         prev_gray = gray
         processed += 1
         if processed % args.plot_every == 0:
-            map_view.show(trajectory, map_points, map_colors)
+            map_view.show(trajectory, map_store)
         return draw_tracks(frame, track_points)
 
     def show_vis(vis: np.ndarray) -> None:
@@ -486,60 +545,80 @@ def main() -> None:
         show_vis(process_slam_frame(frame, gray))
 
     print(f"Running SLAM on {video_path}")
-    print("Video: Rewind / Pause / Play buttons, space = pause, q = quit")
+    if args.max_seconds > 0:
+        print(f"Video stops after {args.max_seconds:g}s (--max-seconds 0 for full video)")
+    print("Video: Rewind / Pause / Play buttons, space = pause/play, q = quit")
     print(f"{MAP_WINDOW}: LMB orbit, RMB pan, scroll dolly, Reset button top-left")
+    print(
+        f"Map: up to {args.max_features} tracks, live cap {args.max_live_points}, "
+        f"archive flush to {cache_dir or 'RAM trim only'}"
+    )
 
     cv2.setMouseCallback(TRACK_WINDOW, on_track_mouse)
     show_vis(draw_tracks(frame, track_points))
 
-    while True:
-        if not map_view.poll():
-            break
+    try:
+        while True:
+            if not map_view.poll():
+                break
 
-        delay = play_delay_ms if playback_mode != PlaybackMode.PAUSED else 1
-        key = cv2.waitKey(delay) & 0xFF
-        if key == ord("q"):
-            break
-        if key == ord(" "):
-            playback_mode = (
-                PlaybackMode.FORWARD
-                if playback_mode == PlaybackMode.PAUSED
-                else PlaybackMode.PAUSED
-            )
-            if last_vis is not None:
-                show_vis(last_vis)
-            continue
-
-        if playback_mode == PlaybackMode.PAUSED:
-            if last_vis is not None:
-                show_vis(last_vis)
-            continue
-
-        if playback_mode == PlaybackMode.FORWARD:
-            ok, frame = read_frame_forward()
-            if not ok:
-                print("End of video.")
-                playback_mode = PlaybackMode.PAUSED
+            if not video_active:
+                map_view.draw()
                 continue
-            frame_index += 1
-        else:
-            ok, frame = read_frame_backward()
-            if not ok:
-                playback_mode = PlaybackMode.PAUSED
+
+            delay = play_delay_ms if playback_mode != PlaybackMode.PAUSED else 1
+            key = cv2.waitKey(delay) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord(" "):
+                playback_mode = (
+                    PlaybackMode.FORWARD
+                    if playback_mode == PlaybackMode.PAUSED
+                    else PlaybackMode.PAUSED
+                )
+                if last_vis is not None:
+                    show_vis(last_vis)
                 continue
-            frame_index = max(0, frame_index - 1)
 
-        if frame_index % args.stride != 0:
-            continue
+            if playback_mode == PlaybackMode.PAUSED:
+                if last_vis is not None:
+                    show_vis(last_vis)
+                continue
 
-        handle_frame(frame)
+            if playback_mode == PlaybackMode.FORWARD:
+                ok, frame = read_frame_forward()
+                if not ok:
+                    print("End of video.")
+                    stop_video_playback()
+                    continue
+                frame_index += 1
+                if args.max_seconds > 0:
+                    t_sec = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                    if t_sec > args.max_seconds:
+                        print(f"Reached --max-seconds {args.max_seconds:g}.")
+                        stop_video_playback()
+                        continue
+            else:
+                ok, frame = read_frame_backward()
+                if not ok:
+                    playback_mode = PlaybackMode.PAUSED
+                    if last_vis is not None:
+                        show_vis(last_vis)
+                    continue
+                frame_index = max(0, frame_index - 1)
 
-    capture.release()
-    map_view.show(trajectory, map_points, map_colors)
-    print("Finished. Press a key in a video window to exit.")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-    map_view.close()
+            if frame_index % args.stride != 0:
+                continue
+
+            handle_frame(frame)
+    finally:
+        if capture.isOpened():
+            capture.release()
+        cv2.destroyAllWindows()
+        if not map_finalized:
+            map_store.finalize()
+        map_view.show(trajectory, map_store)
+        map_view.close()
 
 
 if __name__ == "__main__":
