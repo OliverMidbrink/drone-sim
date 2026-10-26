@@ -24,8 +24,11 @@ LK_PARAMS = dict(
 TRACK_WINDOW = "SLAM tracks"
 
 
-def camera_matrix(width: int, height: int) -> np.ndarray:
-    focal = 0.9 * width
+def camera_matrix(width: int, height: int, fov_deg: float | None = None) -> np.ndarray:
+    if fov_deg is None:
+        focal = 0.9 * width
+    else:
+        focal = width / (2.0 * np.tan(np.radians(fov_deg) / 2.0))
     return np.array(
         [
             [focal, 0.0, width / 2.0],
@@ -176,6 +179,19 @@ def parse_args() -> argparse.Namespace:
         help="resize factor for processing (default: 0.5)",
     )
     parser.add_argument(
+        "--fov-deg",
+        type=float,
+        default=50.0,
+        metavar="DEG",
+        help="horizontal field of view in degrees (default: 50)",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="stop video after this many seconds (default: 0 = full video)",
+    )
+    parser.add_argument(
         "--stride",
         type=int,
         default=1,
@@ -243,7 +259,9 @@ def main() -> None:
         )
 
     height, width = frame.shape[:2]
-    intrinsic = camera_matrix(width, height)
+    intrinsic = camera_matrix(width, height, args.fov_deg)
+    fx = intrinsic[0, 0]
+    print(f"Camera intrinsics: horizontal FOV {args.fov_deg:g}° -> fx={fx:.1f}px")
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     prev_gray = gray
@@ -269,8 +287,12 @@ def main() -> None:
     frame_index = 0
     processed = 0
     paused = False
+    video_active = True
+    map_finalized = False
 
     print(f"Running SLAM on {video_path}")
+    if args.max_seconds > 0:
+        print(f"Video stops after {args.max_seconds:g}s (--max-seconds 0 for full video)")
     print("Video: q = quit, space = pause/resume")
     print(f"{MAP_WINDOW}: LMB orbit, RMB pan, scroll dolly, Reset button top-left")
     print(
@@ -283,11 +305,32 @@ def main() -> None:
             if not map_view.poll():
                 break
 
+            if not video_active:
+                map_view.draw()
+                continue
+
             if not paused:
                 ok, frame = capture.read()
                 if not ok:
                     print("End of video.")
-                    break
+                    video_active = False
+                elif args.max_seconds > 0:
+                    t_sec = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                    if t_sec > args.max_seconds:
+                        print(f"Reached --max-seconds {args.max_seconds:g}.")
+                        video_active = False
+
+                if not video_active:
+                    capture.release()
+                    cv2.destroyAllWindows()
+                    map_store.finalize()
+                    map_finalized = True
+                    map_view.show(trajectory, map_store)
+                    print(
+                        "Video stopped. Explore the 3D map "
+                        "(close the map window when finished)."
+                    )
+                    continue
 
                 frame_index += 1
                 if frame_index % args.stride != 0:
@@ -342,7 +385,7 @@ def main() -> None:
                     current_inlier = current_inlier[valid]
 
                     scale = triangulation_scale(points_cam)
-                    translation = translation.reshape(3) * scale
+                    translation_scaled = translation.reshape(3) * scale
                     points_cam *= scale
 
                     if len(points_cam) > 0:
@@ -354,8 +397,10 @@ def main() -> None:
                         colors = sample_colors(frame, current_inlier)
                         map_store.add(world_points, colors)
 
-                    world_position = world_position + world_rotation @ translation
-                    world_rotation = world_rotation @ rotation
+                    # recoverPose: p_cam2 = R @ p_cam1 + t; camera center in cam1 is -R.T @ t
+                    camera_delta = -(rotation.T @ translation_scaled)
+                    world_position = world_position + world_rotation @ camera_delta
+                    world_rotation = world_rotation @ rotation.T
                     trajectory.append(world_position.copy())
 
                     map_store.archive_out_of_walker_view(
@@ -404,12 +449,12 @@ def main() -> None:
             if key == ord(" "):
                 paused = not paused
     finally:
-        capture.release()
-        map_store.finalize()
-        map_view.show(trajectory, map_store)
-        print("Finished. Press a key in a video window to exit.")
-        cv2.waitKey(0)
+        if capture.isOpened():
+            capture.release()
         cv2.destroyAllWindows()
+        if not map_finalized:
+            map_store.finalize()
+        map_view.show(trajectory, map_store)
         map_view.close()
 
 
