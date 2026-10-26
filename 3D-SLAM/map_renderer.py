@@ -12,10 +12,11 @@ import numpy as np
 from map_store import MapStore
 
 MAP_WINDOW = (
-    "3D SLAM map (LMB look, Ctrl+LMB orbit, RMB pan, WASD/Space/Shift fly, scroll fwd/back)"
+    "3D SLAM map (LMB look, MMB orbit, RMB pan, WASD fly, Space up, Ctrl down, Shift = 3x speed)"
 )
 
 FLY_SPEED = 0.18  # WASD speed, in view-distances per second
+SPRINT_MULTIPLIER = 3.0  # holding Shift
 SCROLL_STEP = 0.1  # scroll notch, in view-distances
 
 INTRO_FOLLOW_SECONDS = 3.0
@@ -170,7 +171,7 @@ class MapRenderer:
         self._intro_start: float | None = None
         self._follow_released = False
         self._orbit_drag = False
-        self._orbit_around_target = False  # Ctrl+LMB orbits instead of looking in place
+        self._orbit_around_target = False  # MMB orbits instead of looking in place
         self._pan_drag = False
         self._last_cursor = (0.0, 0.0)
 
@@ -327,7 +328,7 @@ class MapRenderer:
         if self._ctx is not None and height > 0:
             self._ctx.viewport = (0, 0, width, height)
 
-    def _on_mouse_button(self, _window, button: int, action: int, mods: int) -> None:
+    def _on_mouse_button(self, _window, button: int, action: int, _mods: int) -> None:
         x, y = glfw.get_cursor_pos(self._window)
 
         if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
@@ -336,10 +337,15 @@ class MapRenderer:
                 self.draw()
                 return
             self._orbit_drag = True
-            self._orbit_around_target = bool(mods & glfw.MOD_CONTROL)
+            self._orbit_around_target = False
             self._last_cursor = (x, y)
         elif button == glfw.MOUSE_BUTTON_LEFT and action == glfw.RELEASE:
             self._orbit_drag = False
+        elif button == glfw.MOUSE_BUTTON_MIDDLE:
+            self._orbit_drag = action == glfw.PRESS
+            self._orbit_around_target = True
+            if self._orbit_drag:
+                self._last_cursor = (x, y)
         elif button == glfw.MOUSE_BUTTON_RIGHT:
             self._pan_drag = action == glfw.PRESS
             if self._pan_drag:
@@ -385,7 +391,7 @@ class MapRenderer:
         return glfw.get_key(self._window, key) == glfw.PRESS
 
     def _apply_keyboard_motion(self) -> None:
-        """WASD = fly, Space = up, Shift = down (applies while the map window has focus)."""
+        """WASD = fly, Space = up, Ctrl = down, Shift = 3x speed (while the map window has focus)."""
         now = time.monotonic()
         dt = min(now - self._last_motion_time, 0.1)
         self._last_motion_time = now
@@ -405,13 +411,15 @@ class MapRenderer:
             move -= right
         if self._key_down(glfw.KEY_SPACE):
             move += world_up
-        if self._key_down(glfw.KEY_LEFT_SHIFT) or self._key_down(glfw.KEY_RIGHT_SHIFT):
+        if self._key_down(glfw.KEY_LEFT_CONTROL) or self._key_down(glfw.KEY_RIGHT_CONTROL):
             move -= world_up
 
         length = float(np.linalg.norm(move))
         if length < 1e-9:
             return
         speed = max(self.distance, 0.5) * FLY_SPEED
+        if self._key_down(glfw.KEY_LEFT_SHIFT) or self._key_down(glfw.KEY_RIGHT_SHIFT):
+            speed *= SPRINT_MULTIPLIER
         self.pan += (move / length) * speed * dt
         self._user_camera = True
         self.draw()

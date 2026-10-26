@@ -18,6 +18,7 @@ from anchor_map import (
 )
 from map_renderer import MAP_WINDOW, MapRenderer
 from map_store import MapStore
+from saturation import SaturationMap
 
 DEFAULT_VIDEO = (
     Path(__file__).resolve().parent / "video-samples" / "forest-walking.mp4"
@@ -141,8 +142,27 @@ KEYFRAME_MIN_PARALLAX_PX = 8.0  # median pixel motion vs keyframe before updatin
 KEYFRAME_MIN_MATCHES = 60  # re-anchor the keyframe if fewer tracks survive
 
 
+SATURATED_TRACK_DROP = 0.75  # a fully complete cell keeps this much less of its budget
+MAX_CELL_BOOST = 2.5  # an unmapped cell may take up to this multiple of the base budget
+MIN_CELL_TRACKS = 4  # complete cells still keep a few tracks for pose estimation
+MIN_CELL_OBSERVATIONS = 5  # observations before a cell's saturation is trusted
+SATURATION_INTERVAL_SECONDS = 3.0  # how often finished map regions are thinned to anchors
+
+
 def per_cell_target(target_total: int) -> int:
     return max(3, int(np.ceil(target_total / (TRACK_GRID_COLS * TRACK_GRID_ROWS))))
+
+
+def allocate_cell_targets(target_total: int, saturation: np.ndarray) -> np.ndarray:
+    """Per-cell track budget: cells showing finished map give theirs to unmapped cells.
+
+    `saturation` is the share (0..1) of each image cell already covered by settled
+    anchors. The total stays near `target_total`, so cost is unchanged.
+    """
+    base = target_total / (TRACK_GRID_COLS * TRACK_GRID_ROWS)
+    weight = 1.0 - SATURATED_TRACK_DROP * np.clip(saturation, 0.0, 1.0)
+    targets = base * weight / weight.mean()
+    return np.clip(targets, MIN_CELL_TRACKS, MAX_CELL_BOOST * base)
 
 
 def prune_crowded(
@@ -151,11 +171,13 @@ def prune_crowded(
     width: int,
     height: int,
     target_total: int,
+    targets: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Cap tracks per grid cell (oldest kept) so crowded areas never starve the rest."""
     if len(ids) == 0:
         return points, ids
-    cap = TRACK_CELL_CAP_FACTOR * per_cell_target(target_total)
+    if targets is None:
+        targets = np.full((TRACK_GRID_ROWS, TRACK_GRID_COLS), per_cell_target(target_total))
     flat = points.reshape(-1, 2)
     cx = np.clip((flat[:, 0] * TRACK_GRID_COLS / width).astype(int), 0, TRACK_GRID_COLS - 1)
     cy = np.clip((flat[:, 1] * TRACK_GRID_ROWS / height).astype(int), 0, TRACK_GRID_ROWS - 1)
@@ -167,8 +189,9 @@ def prune_crowded(
     group_sizes = np.diff(np.r_[group_starts, len(order)])
     rank = np.arange(len(order)) - np.repeat(group_starts, group_sizes)
 
+    caps = np.ceil(TRACK_CELL_CAP_FACTOR * targets[cy, cx]).astype(int)
     keep = np.zeros(len(ids), dtype=bool)
-    keep[order[rank < cap]] = True
+    keep[order[rank < caps[order]]] = True
     return points[keep], ids[keep]
 
 
@@ -176,11 +199,13 @@ def detect_balanced(
     gray: np.ndarray,
     existing: np.ndarray | None,
     target_total: int,
+    targets: np.ndarray | None = None,
 ) -> np.ndarray:
     """Detect corners so every grid cell of the frame keeps a share of tracks."""
     height, width = gray.shape[:2]
     cols, rows = TRACK_GRID_COLS, TRACK_GRID_ROWS
-    per_cell = per_cell_target(target_total)
+    if targets is None:
+        targets = np.full((rows, cols), per_cell_target(target_total))
 
     pts = (
         np.empty((0, 2), dtype=np.float32)
@@ -206,6 +231,7 @@ def detect_balanced(
         y0, y1 = r * height // rows, (r + 1) * height // rows
         for c in range(cols):
             have = int(counts[r, c])
+            per_cell = int(round(targets[r, c]))
             if have >= per_cell * TRACK_REFILL_FRACTION:
                 continue
             x0, x1 = c * width // cols, (c + 1) * width // cols
@@ -525,6 +551,12 @@ def parse_args() -> argparse.Namespace:
         "from the camera path (default: 0.12; typical spacing is ~0.03)",
     )
     parser.add_argument(
+        "--no-saturation",
+        action="store_true",
+        help="keep mapping everywhere at full resolution (no thinning of finished "
+        "regions, fixed tracking budget per image cell)",
+    )
+    parser.add_argument(
         "--plot-every",
         type=int,
         default=3,
@@ -611,8 +643,15 @@ def main() -> None:
     )
 
     anchors = None if args.no_anchors else AnchorMap(max_anchors=args.max_anchors)
-    stats = {"commits": 0, "fixes": 0, "associated": 0, "pruned": 0}
-    prune_state = {"last": 0.0}
+    stats = {
+        "commits": 0, "fixes": 0, "associated": 0, "pruned": 0, "thinned": 0, "redundant": 0,
+    }
+    prune_state = {"last": 0.0, "saturate": 0.0}
+    saturation_map = None if args.no_saturation else SaturationMap()
+    cell_targets = np.full(
+        (TRACK_GRID_ROWS, TRACK_GRID_COLS),
+        float(per_cell_target(args.max_features)),
+    )
 
     map_height = max(320, height // 2)
     map_view = MapRenderer(width, map_height)
@@ -639,7 +678,8 @@ def main() -> None:
                 f"tracks: {len(track_points)}  poses: {len(trajectory)}  "
                 f"live: {map_store.live_count}  stored: {map_store.archive_count}  "
                 f"anchors: {len(anchors) if anchors is not None else 0}  "
-                f"fixes: {stats['fixes']}  pruned: {stats['pruned']}"
+                f"fixes: {stats['fixes']}  pruned: {stats['pruned']}  "
+                f"settled: {len(saturation_map) if saturation_map is not None else 0}"
             ),
             f"time: {t_sec:.1f}s  frame: {int(capture.get(cv2.CAP_PROP_POS_FRAMES))}  ({mode_label})",
         ]
@@ -676,6 +716,19 @@ def main() -> None:
             "Video stopped. Explore the 3D map "
             "(close the map window when finished)."
         )
+
+    def update_cell_targets(pixels: np.ndarray, settled: np.ndarray) -> None:
+        """Shift the tracking budget from image cells that show finished map to the rest."""
+        nonlocal cell_targets
+        cx = np.clip((pixels[:, 0] * TRACK_GRID_COLS / width).astype(int), 0, TRACK_GRID_COLS - 1)
+        cy = np.clip((pixels[:, 1] * TRACK_GRID_ROWS / height).astype(int), 0, TRACK_GRID_ROWS - 1)
+        total = np.zeros((TRACK_GRID_ROWS, TRACK_GRID_COLS))
+        done = np.zeros_like(total)
+        np.add.at(total, (cy, cx), 1.0)
+        np.add.at(done, (cy, cx), settled.astype(float))
+        fraction = np.where(total >= MIN_CELL_OBSERVATIONS, done / np.maximum(total, 1.0), 0.0)
+        wanted = allocate_cell_targets(args.max_features, fraction)
+        cell_targets = 0.6 * cell_targets + 0.4 * wanted
 
     def video_clock() -> float:
         """Seconds of video processed so far (the age of landmarks is measured in this)."""
@@ -724,6 +777,8 @@ def main() -> None:
                     map_store.warp(correction, start, step)
                     anchors.warp(correction, start, step)
                     anchors.last_fix_step = step
+                    if saturation_map is not None:
+                        saturation_map.mark_dirty()
                     world_rotation, world_position = fix.rotation, fix.position.copy()
                     key_ids = np.empty(0, dtype=np.int64)  # births were in the old frame
                     stats["fixes"] += 1
@@ -889,6 +944,17 @@ def main() -> None:
                                 inlier_ids = remap_ids(inlier_ids, source, target[hit])
                                 good_ids = remap_ids(good_ids, source, target[hit])
                                 stats["associated"] += int(hit.sum())
+                        if saturation_map is not None and len(obs_points):
+                            distance = np.linalg.norm(obs_points - world_position, axis=1)
+                            settled = saturation_map.settled(map_store, obs_points, distance)
+                            update_cell_targets(obs_pixels, settled)
+                            known_now, _ = map_store.lookup(obs_ids)
+                            redundant = settled & ~known_now  # complete region: nothing new to add
+                            if redundant.any():
+                                stats["redundant"] += int(redundant.sum())
+                                fresh_only = ~redundant
+                                obs_points, colors = obs_points[fresh_only], colors[fresh_only]
+                                obs_ids, weights = obs_ids[fresh_only], weights[fresh_only]
                         map_store.add(obs_points, colors, obs_ids, weights, step, now=video_clock())
 
                     stats["commits"] += 1
@@ -904,7 +970,17 @@ def main() -> None:
                             args.prune_age,
                             args.prune_isolation,
                             check_window=2.0 * PRUNE_INTERVAL_SECONDS,
+                            exempt_ids=None if saturation_map is None else saturation_map.anchor_ids,
                         )
+                    if (
+                        saturation_map is not None
+                        and clock - prune_state["saturate"] >= SATURATION_INTERVAL_SECONDS
+                    ):
+                        prune_state["saturate"] = clock
+                        _, thinned = saturation_map.consolidate(
+                            map_store, clock, np.asarray(trajectory)
+                        )
+                        stats["thinned"] += thinned
 
                     map_store.archive_out_of_walker_view(
                         world_rotation,
@@ -921,10 +997,10 @@ def main() -> None:
         # Thin out crowded cells, then refill every sparse cell (including newly
         # revealed edges) so the whole image stays tracked in either direction.
         flat_tracks, track_ids = prune_crowded(
-            track_points, track_ids, width, height, args.max_features
+            track_points, track_ids, width, height, args.max_features, cell_targets
         )
         track_points = flat_tracks.reshape(-1, 1, 2)
-        fresh = detect_balanced(gray, track_points, args.max_features)
+        fresh = detect_balanced(gray, track_points, args.max_features, cell_targets)
         if len(fresh):
             fresh_ids = np.arange(
                 next_track_id, next_track_id + len(fresh), dtype=np.int64
@@ -973,8 +1049,8 @@ def main() -> None:
         print(f"Video stops after {args.max_seconds:g}s (--max-seconds 0 for full video)")
     print("Video: Rewind / Pause / Play buttons, space = pause/play, q = quit")
     print(
-        "Map window: LMB look around, Ctrl+LMB orbit, RMB pan, W/A/S/D fly, Space up, Shift down, "
-        "scroll forward/back, Reset button top-left"
+        "Map window: LMB look around, MMB orbit, RMB pan, W/A/S/D fly, Space up, Ctrl down, "
+        "Shift = 3x speed, scroll forward/back, Reset button top-left"
     )
     print(
         f"Map: up to {args.max_features} tracks, live cap {args.max_live_points}, "
@@ -1044,6 +1120,12 @@ def main() -> None:
         cv2.destroyAllWindows()
         if not map_finalized:
             map_store.finalize()
+        print(
+            f"[map] {len(map_store)} landmarks | settled anchors "
+            f"{len(saturation_map) if saturation_map is not None else 0}, "
+            f"thinned {stats['thinned']}, redundant skipped {stats['redundant']} | "
+            f"isolated pruned {stats['pruned']} | loop fixes {stats['fixes']}"
+        )
         map_view.show(trajectory, map_store)
         map_view.close()
 

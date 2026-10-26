@@ -410,6 +410,7 @@ class MapStore:
         min_age: float,
         isolation_factor: float,
         check_window: float = 8.0,
+        exempt_ids: np.ndarray | None = None,
     ) -> int:
         """Delete landmarks that never gained company.
 
@@ -455,10 +456,20 @@ class MapStore:
 
         doomed = np.zeros(n_live + n_arch, dtype=bool)
         doomed[due] = nearest > isolation_factor * np.maximum(path_dist, 1e-6)
+        if exempt_ids is not None and len(exempt_ids) and doomed.any():
+            ids = np.concatenate([self.live_ids, self.archive_ids])
+            doomed &= ~np.isin(ids, exempt_ids)
+        return self.remove_rows(doomed)
+
+    def remove_rows(self, doomed: np.ndarray) -> int:
+        """Delete landmarks by row (live rows first, then RAM-archive rows).
+
+        Their track ids are remembered so those tracks are never re-added.
+        """
         count = int(doomed.sum())
         if count == 0:
             return 0
-
+        n_live = len(self.live_positions)
         ids = np.concatenate([self.live_ids, self.archive_ids])
         self.rejected_ids = np.union1d(self.rejected_ids, ids[doomed])
         self._keep_live(~doomed[:n_live])
