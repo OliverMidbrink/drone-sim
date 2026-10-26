@@ -91,8 +91,9 @@ def visible_from_orbit(
 
 
 class MapStore:
-    # Observations averaged per landmark: running mean up to this many, then EMA.
-    FUSE_WINDOW = 8
+    # Total observation weight a landmark can accumulate; beyond this, new
+    # observations keep a small constant influence so the map can still adapt.
+    WEIGHT_CAP = 400.0
 
     def __init__(
         self,
@@ -107,7 +108,7 @@ class MapStore:
         self.live_positions = _empty_points()
         self.live_colors = _empty_colors()
         self.live_ids = np.empty(0, dtype=np.int64)
-        self.live_counts = np.empty(0, dtype=np.int32)
+        self.live_weights = np.empty(0, dtype=np.float64)
         self.archive_positions = _empty_points()
         self.archive_colors = _empty_colors()
         self.disk_point_count = 0
@@ -134,15 +135,33 @@ class MapStore:
     def archive_count(self) -> int:
         return len(self.archive_positions) + self.disk_point_count
 
+    def lookup(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Landmark positions for track ids: (found mask, positions of found ids)."""
+        found = np.zeros(len(ids), dtype=bool)
+        if len(self.live_ids) == 0 or len(ids) == 0:
+            return found, _empty_points()
+        order = np.argsort(self.live_ids)
+        sorted_ids = self.live_ids[order]
+        pos = np.minimum(np.searchsorted(sorted_ids, ids), len(sorted_ids) - 1)
+        found = sorted_ids[pos] == ids
+        return found, self.live_positions[order[pos[found]]]
+
     def add(
         self,
         world_points: np.ndarray,
         colors: np.ndarray,
         ids: np.ndarray,
+        weights: np.ndarray | None = None,
     ) -> None:
-        """Insert observations; refine existing landmarks that share a track id."""
+        """Insert observations; refine landmarks that share a track id.
+
+        Each observation carries a weight (e.g. from its triangulation angle):
+        well-conditioned observations pull a landmark harder than noisy ones.
+        """
         if len(world_points) == 0:
             return
+        if weights is None:
+            weights = np.ones(len(ids), dtype=np.float64)
 
         is_new = np.ones(len(ids), dtype=bool)
         if len(self.live_ids) > 0:
@@ -152,20 +171,19 @@ class MapStore:
             matched = sorted_ids[pos] == ids
             if matched.any():
                 rows = order[pos[matched]]
-                weight = np.minimum(self.live_counts[rows] + 1, self.FUSE_WINDOW)
-                step = (1.0 / weight)[:, None]
-                self.live_positions[rows] += (world_points[matched] - self.live_positions[rows]) * step
-                self.live_colors[rows] += (colors[matched] - self.live_colors[rows]) * step
-                self.live_counts[rows] = weight
+                w_new = weights[matched]
+                w_old = self.live_weights[rows]
+                alpha = (w_new / (w_old + w_new))[:, None]
+                self.live_positions[rows] += (world_points[matched] - self.live_positions[rows]) * alpha
+                self.live_colors[rows] += (colors[matched] - self.live_colors[rows]) * alpha
+                self.live_weights[rows] = np.minimum(w_old + w_new, self.WEIGHT_CAP)
                 is_new = ~matched
 
         if is_new.any():
             self.live_positions = np.vstack([self.live_positions, world_points[is_new]])
             self.live_colors = np.vstack([self.live_colors, colors[is_new]])
             self.live_ids = np.concatenate([self.live_ids, ids[is_new].astype(np.int64)])
-            self.live_counts = np.concatenate(
-                [self.live_counts, np.ones(int(is_new.sum()), dtype=np.int32)]
-            )
+            self.live_weights = np.concatenate([self.live_weights, weights[is_new]])
 
         if len(self.live_positions) > self.max_live_points:
             overflow = len(self.live_positions) - self.max_live_points
@@ -176,7 +194,7 @@ class MapStore:
         self.live_positions = self.live_positions[selector]
         self.live_colors = self.live_colors[selector]
         self.live_ids = self.live_ids[selector]
-        self.live_counts = self.live_counts[selector]
+        self.live_weights = self.live_weights[selector]
 
     def archive_out_of_walker_view(
         self,
@@ -271,7 +289,7 @@ class MapStore:
         target: np.ndarray,
         aspect: float,
         *,
-        max_points: int = 80_000,
+        max_points: int = 150_000,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Points to upload to the GPU for the current orbit view."""
         blocks: list[np.ndarray] = []

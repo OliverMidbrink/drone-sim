@@ -320,6 +320,56 @@ def triangulate_pair(
     return points
 
 
+MIN_TRIANGULATION_DEG = 1.0  # ignore observations with less ray separation than this
+MAX_RAY_GAP = 0.1  # reject if the two rays miss by more than this fraction of depth
+MAX_OBSERVATION_WEIGHT = 100.0
+MIN_SCALE_MATCHES = 12  # landmarks needed to anchor the step scale to the map
+
+
+def pixel_rays(
+    pixels: np.ndarray,
+    intrinsic: np.ndarray,
+    cam_to_world: np.ndarray,
+) -> np.ndarray:
+    """Unit world-space viewing rays; cam_to_world is (3,3) or per-pixel (N,3,3)."""
+    homogeneous = np.column_stack([pixels, np.ones(len(pixels))])
+    rays_cam = homogeneous @ np.linalg.inv(intrinsic).T
+    if cam_to_world.ndim == 2:
+        rays = rays_cam @ cam_to_world.T
+    else:
+        rays = np.einsum("nij,nj->ni", cam_to_world, rays_cam)
+    return rays / np.linalg.norm(rays, axis=1, keepdims=True)
+
+
+def triangulate_midpoint(
+    origin_a: np.ndarray,
+    dir_a: np.ndarray,
+    origin_b: np.ndarray,
+    dir_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Closest point between two ray sets: (points, angle in degrees, valid mask)."""
+    cos_ab = np.einsum("ij,ij->i", dir_a, dir_b)
+    offset = origin_a - origin_b
+    d = np.einsum("ij,ij->i", dir_a, offset)
+    e = np.einsum("ij,ij->i", dir_b, offset)
+    denom = np.maximum(1.0 - cos_ab**2, 1e-12)
+    s = (cos_ab * e - d) / denom
+    t = (e - cos_ab * d) / denom
+
+    point_a = origin_a + s[:, None] * dir_a
+    point_b = origin_b + t[:, None] * dir_b
+    gap = np.linalg.norm(point_a - point_b, axis=1)
+    angle = np.degrees(np.arccos(np.clip(cos_ab, -1.0, 1.0)))
+
+    valid = (
+        (s > 0.0)
+        & (t > 0.0)
+        & (angle >= MIN_TRIANGULATION_DEG)
+        & (gap <= MAX_RAY_GAP * np.maximum(s, 1e-9))
+    )
+    return 0.5 * (point_a + point_b), angle, valid
+
+
 def transform_points_to_world(
     points_cam: np.ndarray,
     world_rotation: np.ndarray,
@@ -401,8 +451,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-features",
         type=int,
-        default=2000,
-        help="target tracked features per frame (default: 2000)",
+        default=4000,
+        help="target tracked features per frame (default: 4000)",
     )
     parser.add_argument(
         "--fb-check",
@@ -415,8 +465,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-live-points",
         type=int,
-        default=50_000,
-        help="max landmarks kept in active RAM (default: 50000)",
+        default=100_000,
+        help="max landmarks kept in active RAM (default: 100000)",
     )
     parser.add_argument(
         "--ram-archive-limit",
@@ -478,20 +528,41 @@ def main() -> None:
     track_ids = np.arange(len(track_points), dtype=np.int64)
     next_track_id = len(track_points)
 
-    key_ids = np.empty(0, dtype=np.int64)
-    key_pts = np.empty((0, 2), dtype=np.float32)
-
-    def set_keyframe(points: np.ndarray, ids: np.ndarray) -> None:
-        nonlocal key_ids, key_pts
-        order = np.argsort(ids)
-        key_ids = ids[order]
-        key_pts = points.reshape(-1, 2)[order].copy()
-
-    set_keyframe(track_points, track_ids)
-
     world_rotation = np.eye(3, dtype=np.float64)
     world_position = np.zeros(3, dtype=np.float64)
     trajectory = [world_position.copy()]
+    last_step_length: float | None = None
+
+    # Keyframe: the tracked points (sorted by id) at the last pose update, plus each
+    # track's *first* observation and the pose it was seen from, so depth can be
+    # triangulated over the longest baseline available.
+    key_ids = np.empty(0, dtype=np.int64)
+    key_pts = np.empty((0, 2), dtype=np.float64)
+    key_birth_px = np.empty((0, 2), dtype=np.float64)
+    key_birth_R = np.empty((0, 3, 3), dtype=np.float64)
+    key_birth_C = np.empty((0, 3), dtype=np.float64)
+
+    def set_keyframe(points: np.ndarray, ids: np.ndarray) -> None:
+        nonlocal key_ids, key_pts, key_birth_px, key_birth_R, key_birth_C
+        order = np.argsort(ids)
+        new_ids = ids[order]
+        new_pts = points.reshape(-1, 2)[order].astype(np.float64)
+        count = len(new_ids)
+
+        birth_px = new_pts.copy()
+        birth_R = np.broadcast_to(world_rotation, (count, 3, 3)).copy()
+        birth_C = np.broadcast_to(world_position, (count, 3)).copy()
+        if len(key_ids) > 0 and count > 0:
+            old = np.minimum(np.searchsorted(key_ids, new_ids), len(key_ids) - 1)
+            known = key_ids[old] == new_ids
+            birth_px[known] = key_birth_px[old[known]]
+            birth_R[known] = key_birth_R[old[known]]
+            birth_C[known] = key_birth_C[old[known]]
+
+        key_ids, key_pts = new_ids, new_pts.astype(np.float32)
+        key_birth_px, key_birth_R, key_birth_C = birth_px, birth_R, birth_C
+
+    set_keyframe(track_points, track_ids)
 
     cache_dir = None if args.no_disk_cache else args.map_cache.expanduser().resolve()
     map_store = MapStore(
@@ -563,7 +634,7 @@ def main() -> None:
 
     def process_slam_frame(frame: np.ndarray, gray: np.ndarray) -> np.ndarray:
         nonlocal prev_gray, track_points, track_ids, next_track_id, processed
-        nonlocal world_rotation, world_position, trajectory
+        nonlocal world_rotation, world_position, trajectory, last_step_length
 
         if len(track_points) < 8:
             track_points = detect_balanced(gray, None, args.max_features)
@@ -607,36 +678,58 @@ def main() -> None:
                     key_inlier = key_matched[inliers]
                     current_inlier = current_matched[inliers]
                     inlier_ids = ids_matched[inliers]
+                    inlier_rows = pos[matched][inliers]
 
-                    points_cam = triangulate_pair(
-                        intrinsic,
-                        rotation,
-                        translation,
-                        key_inlier,
-                        current_inlier,
+                    # Step length: the essential matrix only gives direction, so anchor
+                    # the scale to landmarks already in the map. This keeps the scale
+                    # consistent from step to step instead of resetting it every time.
+                    unit_points = triangulate_pair(
+                        intrinsic, rotation, translation, key_inlier, current_inlier
                     )
-                    valid = points_cam[:, 2] > 0.1
-                    points_cam = points_cam[valid]
-                    current_inlier = current_inlier[valid]
-                    inlier_ids = inlier_ids[valid]
-
-                    scale = triangulation_scale(points_cam)
-                    translation_scaled = translation.reshape(3) * scale
-                    points_cam *= scale
-
-                    if len(points_cam) > 0:
-                        world_points = transform_points_to_world(
-                            points_cam,
-                            world_rotation,
-                            world_position,
+                    scale = None
+                    found, landmarks = map_store.lookup(inlier_ids)
+                    if found.sum() >= MIN_SCALE_MATCHES:
+                        depth_unit = unit_points[found, 2]
+                        depth_map = ((landmarks - world_position) @ world_rotation)[:, 2]
+                        usable = (depth_unit > 1e-3) & (depth_map > 1e-3)
+                        if usable.sum() >= MIN_SCALE_MATCHES:
+                            scale = float(np.median(depth_map[usable] / depth_unit[usable]))
+                    if scale is None:
+                        scale = (
+                            last_step_length
+                            if last_step_length is not None
+                            else triangulation_scale(unit_points)
                         )
-                        colors = sample_colors(frame, current_inlier)
-                        map_store.add(world_points, colors, inlier_ids)
+                    if last_step_length is not None:
+                        scale = float(
+                            np.clip(scale, last_step_length / 4.0, last_step_length * 4.0)
+                        )
 
-                    camera_delta = -(rotation.T @ translation_scaled)
+                    camera_delta = -(rotation.T @ (translation.reshape(3) * scale))
                     world_position = world_position + world_rotation @ camera_delta
                     world_rotation = world_rotation @ rotation.T
+                    last_step_length = float(np.linalg.norm(camera_delta))
                     trajectory.append(world_position.copy())
+
+                    # Triangulate from each track's first sighting to now: the baseline
+                    # keeps growing as the camera moves, so distant and straight-ahead
+                    # points sharpen over time instead of staying noisy.
+                    rays_birth = pixel_rays(
+                        key_birth_px[inlier_rows], intrinsic, key_birth_R[inlier_rows]
+                    )
+                    rays_now = pixel_rays(current_inlier, intrinsic, world_rotation)
+                    points_world, angle_deg, usable = triangulate_midpoint(
+                        key_birth_C[inlier_rows],
+                        rays_birth,
+                        np.broadcast_to(world_position, (len(rays_now), 3)),
+                        rays_now,
+                    )
+                    if usable.any():
+                        weights = np.clip(angle_deg[usable] ** 2, 0.01, MAX_OBSERVATION_WEIGHT)
+                        colors = sample_colors(frame, current_inlier[usable])
+                        map_store.add(
+                            points_world[usable], colors, inlier_ids[usable], weights
+                        )
 
                     map_store.archive_out_of_walker_view(
                         world_rotation,
@@ -705,7 +798,7 @@ def main() -> None:
         print(f"Video stops after {args.max_seconds:g}s (--max-seconds 0 for full video)")
     print("Video: Rewind / Pause / Play buttons, space = pause/play, q = quit")
     print(
-        "Map window: LMB orbit, RMB pan, W/A/S/D fly, Space up, Shift down, "
+        "Map window: LMB look around, Ctrl+LMB orbit, RMB pan, W/A/S/D fly, Space up, Shift down, "
         "scroll forward/back, Reset button top-left"
     )
     print(

@@ -11,15 +11,27 @@ import numpy as np
 
 from map_store import MapStore
 
-MAP_WINDOW = "3D SLAM map (LMB orbit, RMB pan, WASD/Space/Shift fly, scroll fwd/back)"
+MAP_WINDOW = (
+    "3D SLAM map (LMB look, Ctrl+LMB orbit, RMB pan, WASD/Space/Shift fly, scroll fwd/back)"
+)
 
-FLY_SPEED = 0.6  # WASD speed, in view-distances per second
+FLY_SPEED = 0.18  # WASD speed, in view-distances per second
 SCROLL_STEP = 0.1  # scroll notch, in view-distances
 
 INTRO_FOLLOW_SECONDS = 3.0
 
 # 180° rotation about X: SLAM (x right, y down, z forward) -> view (y up, z back).
 SLAM_TO_VIEW = np.array([1.0, -1.0, -1.0])
+
+# Map points are drawn as splats whose world size is ~the typical spacing between
+# neighbouring points, so the cloud reads as a continuous surface.
+SPLAT_SPACING_FACTOR = 0.26  # splat diameter / median nearest-neighbour spacing
+SPLAT_MIN_PX = 1.5
+SPLAT_MAX_PX = 24.0
+SPACING_RECOMPUTE_SECONDS = 1.0
+SPACING_SAMPLE_POINTS = 20_000
+SPACING_QUERY_POINTS = 600
+PROJECTION_FOV_Y_DEG = 45.0
 
 MARKER_DIAMETER_PX = 16  # camera sphere size on screen (logical pixels)
 MARKER_COLOR = (1.0, 0.25, 0.2)
@@ -32,11 +44,17 @@ _VERTEX_SHADER = """
 in vec3 in_position;
 in vec3 in_color;
 uniform mat4 mvp;
+uniform float splat_world_size;  // splat diameter in world units
+uniform float focal_px;          // projection focal length in framebuffer pixels
+uniform vec2 splat_px_limits;    // min / max on-screen diameter
 out vec3 v_color;
 void main() {
     gl_Position = mvp * vec4(in_position, 1.0);
     v_color = in_color;
-    gl_PointSize = 2.5;
+    // Perspective-scaled: a fixed world-space size, so splats grow as you
+    // approach and fill the gaps between neighbouring points.
+    float px = splat_world_size * focal_px / max(gl_Position.w, 1e-4);
+    gl_PointSize = clamp(px, splat_px_limits.x, splat_px_limits.y);
 }
 """
 
@@ -152,6 +170,7 @@ class MapRenderer:
         self._intro_start: float | None = None
         self._follow_released = False
         self._orbit_drag = False
+        self._orbit_around_target = False  # Ctrl+LMB orbits instead of looking in place
         self._pan_drag = False
         self._last_cursor = (0.0, 0.0)
 
@@ -172,6 +191,8 @@ class MapRenderer:
         self._path_vbo: moderngl.Buffer | None = None
         self._point_count = 0
         self._path_count = 0
+        self._point_spacing: float | None = None
+        self._spacing_time = 0.0
 
     def setup_window(self, margin_x: int = 40, margin_y: int = 40) -> None:
         if not glfw.init():
@@ -306,7 +327,7 @@ class MapRenderer:
         if self._ctx is not None and height > 0:
             self._ctx.viewport = (0, 0, width, height)
 
-    def _on_mouse_button(self, _window, button: int, action: int, _mods: int) -> None:
+    def _on_mouse_button(self, _window, button: int, action: int, mods: int) -> None:
         x, y = glfw.get_cursor_pos(self._window)
 
         if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
@@ -315,6 +336,7 @@ class MapRenderer:
                 self.draw()
                 return
             self._orbit_drag = True
+            self._orbit_around_target = bool(mods & glfw.MOD_CONTROL)
             self._last_cursor = (x, y)
         elif button == glfw.MOUSE_BUTTON_LEFT and action == glfw.RELEASE:
             self._orbit_drag = False
@@ -332,9 +354,14 @@ class MapRenderer:
         self._last_cursor = (x, y)
 
         if self._orbit_drag:
+            eye = self._target() + self._orbit_direction() * self.distance
             self.yaw -= dx * 0.008
             self.pitch += dy * 0.008
             self.pitch = float(np.clip(self.pitch, -1.45, 1.45))
+            if not self._orbit_around_target:
+                # Look around in place: keep the eye fixed and swing the target.
+                new_target = eye - self._orbit_direction() * self.distance
+                self.pan = new_target - self.focus
         elif self._pan_drag:
             right, up = self._camera_right_up()
             scale = self.distance * 0.0025
@@ -409,7 +436,7 @@ class MapRenderer:
 
         fb_w, fb_h = glfw.get_framebuffer_size(self._window)
         aspect = fb_w / max(fb_h, 1)
-        projection = _perspective(45.0, aspect, 0.02, 500.0)
+        projection = _perspective(PROJECTION_FOV_Y_DEG, aspect, 0.02, 500.0)
 
         target = self._target()
         direction = self._orbit_direction()
@@ -439,6 +466,12 @@ class MapRenderer:
 
         mvp = projection @ view
         self._program["mvp"].write(mvp.astype(np.float32).T.tobytes())
+        self._update_point_spacing(self._render_points)
+        spacing = self._point_spacing if self._point_spacing is not None else 0.0
+        focal_px = fb_h / (2.0 * np.tan(np.radians(PROJECTION_FOV_Y_DEG) / 2.0))
+        self._program["splat_world_size"].value = float(spacing * SPLAT_SPACING_FACTOR)
+        self._program["focal_px"].value = float(focal_px)
+        self._program["splat_px_limits"].value = (SPLAT_MIN_PX, SPLAT_MAX_PX)
 
         self._ctx.enable(moderngl.DEPTH_TEST | moderngl.PROGRAM_POINT_SIZE)
         self._ctx.clear(0.11, 0.11, 0.12)
@@ -465,6 +498,42 @@ class MapRenderer:
         self._draw_reset_button()
 
         glfw.swap_buffers(self._window)
+
+    def _update_point_spacing(self, points: np.ndarray) -> None:
+        """Median nearest-neighbour spacing of the drawn points (re-estimated ~1x/s)."""
+        now = time.monotonic()
+        if self._point_spacing is not None and now - self._spacing_time < SPACING_RECOMPUTE_SECONDS:
+            return
+        n = len(points)
+        if n < 50:
+            return
+        self._spacing_time = now
+
+        rng = np.random.default_rng(0)
+        sample_n = min(n, SPACING_SAMPLE_POINTS)
+        sample = points[rng.choice(n, sample_n, replace=False)].astype(np.float32)
+        queries = sample[: min(sample_n, SPACING_QUERY_POINTS)]
+
+        sample_sq = np.einsum("ij,ij->i", sample, sample)
+        nearest = np.empty(len(queries), dtype=np.float32)
+        for start in range(0, len(queries), 150):
+            chunk = queries[start : start + 150]
+            d2 = (
+                np.einsum("ij,ij->i", chunk, chunk)[:, None]
+                + sample_sq[None, :]
+                - 2.0 * chunk @ sample.T
+            )
+            d2[d2 < 1e-12] = np.inf  # self matches
+            nearest[start : start + 150] = d2.min(axis=1)
+        spacing_sample = float(np.sqrt(max(np.median(nearest), 0.0)))
+        if not np.isfinite(spacing_sample) or spacing_sample <= 0:
+            return
+        # Surfaces: spacing scales with 1/sqrt(density), correct for subsampling.
+        spacing = spacing_sample * np.sqrt(sample_n / n)
+        if self._point_spacing is None:
+            self._point_spacing = spacing
+        else:
+            self._point_spacing = 0.5 * self._point_spacing + 0.5 * spacing
 
     def _draw_camera_marker(self, position: np.ndarray, mvp: np.ndarray) -> None:
         """Sphere at the current camera position, always drawn on top of the cloud."""
