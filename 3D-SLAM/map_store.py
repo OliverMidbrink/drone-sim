@@ -119,6 +119,7 @@ class MapStore:
         self.archive_steps = np.empty(0, dtype=np.int32)
         self.archive_born = np.empty(0, dtype=np.float64)
         self.rejected_ids = np.empty(0, dtype=np.int64)  # pruned tracks stay out of the map
+        self.protected_ids = np.empty(0, dtype=np.int64)  # mesh corners: exempt from thinning/pruning
         self.disk_point_count = 0
         self._chunk_id = 0
         self._disk_positions = _empty_points()
@@ -153,6 +154,36 @@ class MapStore:
         pos = np.minimum(np.searchsorted(sorted_ids, ids), len(sorted_ids) - 1)
         found = sorted_ids[pos] == ids
         return found, self.live_positions[order[pos[found]]]
+
+    def lookup_all(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Live landmarks for track ids: (found mask, positions, weights) of the found ids."""
+        found = np.zeros(len(ids), dtype=bool)
+        if len(self.live_ids) == 0 or len(ids) == 0:
+            return found, _empty_points(), np.empty(0)
+        order = np.argsort(self.live_ids)
+        sorted_ids = self.live_ids[order]
+        pos = np.minimum(np.searchsorted(sorted_ids, ids), len(sorted_ids) - 1)
+        found = sorted_ids[pos] == ids
+        rows = order[pos[found]]
+        return found, self.live_positions[rows], self.live_weights[rows]
+
+    def positions_for(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Position and colour of landmarks in RAM (live or archived): (found, positions, colours)."""
+        n = len(ids)
+        found = np.zeros(n, dtype=bool)
+        positions = np.zeros((n, 3), dtype=np.float64)
+        colors = np.zeros((n, 3), dtype=np.float64)
+        all_ids = np.concatenate([self.live_ids, self.archive_ids])
+        if len(all_ids) == 0 or n == 0:
+            return found, positions, colors
+        order = np.argsort(all_ids)
+        sorted_ids = all_ids[order]
+        slot = np.minimum(np.searchsorted(sorted_ids, ids), len(sorted_ids) - 1)
+        found = sorted_ids[slot] == ids
+        rows = order[slot[found]]
+        positions[found] = np.vstack([self.live_positions, self.archive_positions])[rows]
+        colors[found] = np.vstack([self.live_colors, self.archive_colors])[rows]
+        return found, positions, colors
 
     def lookup_weights(self, ids: np.ndarray) -> np.ndarray:
         """Accumulated observation weight per id (0 where the id is not live)."""
@@ -466,11 +497,14 @@ class MapStore:
 
         Their track ids are remembered so those tracks are never re-added.
         """
+        n_live = len(self.live_positions)
+        ids = np.concatenate([self.live_ids, self.archive_ids])
+        if len(self.protected_ids):
+            # Corners of mesh faces are the surface's resolution: never thin them away.
+            doomed = doomed & ~np.isin(ids, self.protected_ids)
         count = int(doomed.sum())
         if count == 0:
             return 0
-        n_live = len(self.live_positions)
-        ids = np.concatenate([self.live_ids, self.archive_ids])
         self.rejected_ids = np.union1d(self.rejected_ids, ids[doomed])
         self._keep_live(~doomed[:n_live])
         keep_a = ~doomed[n_live:]

@@ -3,6 +3,7 @@
 
 import argparse
 from enum import IntEnum
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -18,12 +19,14 @@ from anchor_map import (
 )
 from map_renderer import MAP_WINDOW, MapRenderer
 from map_store import MapStore
+from mesh_builder import MeshBuilder, write_ply, write_stl
 from saturation import SaturationMap
 
 DEFAULT_VIDEO = (
     Path(__file__).resolve().parent / "video-samples" / "forest-walking.mp4"
 )
 DEFAULT_MAP_CACHE = Path(__file__).resolve().parent / ".map-cache"
+DEFAULT_EXPORT_DIR = Path(__file__).resolve().parent / "exports"
 
 LK_PARAMS = dict(
     winSize=(21, 21),
@@ -41,10 +44,16 @@ class PlaybackMode(IntEnum):
     REVERSE = 2
 
 
+VIEW_TOGGLE = "view-toggle"  # transport-bar region key for the Points/Mesh button
+
+BarRegion = tuple["PlaybackMode | str", int, int, int, int]
+
+
 def draw_transport_bar(
     width: int,
     mode: PlaybackMode,
-) -> tuple[np.ndarray, list[tuple[PlaybackMode, int, int, int, int]]]:
+    view_mode: str | None = None,
+) -> tuple[np.ndarray, list[BarRegion]]:
     bar = np.zeros((TRANSPORT_BAR_HEIGHT, width, 3), dtype=np.uint8)
     bar[:] = (42, 42, 48)
 
@@ -57,7 +66,7 @@ def draw_transport_bar(
     gap = 10
     total_w = len(labels) * button_w + (len(labels) - 1) * gap
     x = max(8, (width - total_w) // 2)
-    regions: list[tuple[PlaybackMode, int, int, int, int]] = []
+    regions: list[BarRegion] = []
 
     for play_mode, text in labels:
         x1 = x + button_w
@@ -79,6 +88,26 @@ def draw_transport_bar(
         regions.append((play_mode, x, 6, x1, y1))
         x = x1 + gap
 
+    if view_mode is not None:
+        toggle_w = 132
+        tx0 = width - toggle_w - 8
+        ty1 = TRANSPORT_BAR_HEIGHT - 8
+        if tx0 > x:  # only when it does not collide with the playback buttons
+            mesh = view_mode == "mesh"
+            cv2.rectangle(bar, (tx0, 6), (tx0 + toggle_w, ty1), (80, 150, 90) if mesh else (58, 58, 64), -1)
+            cv2.rectangle(bar, (tx0, 6), (tx0 + toggle_w, ty1), (110, 110, 120), 1)
+            cv2.putText(
+                bar,
+                "View: Mesh" if mesh else "View: Points",
+                (tx0 + 10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (240, 240, 245),
+                1,
+                cv2.LINE_AA,
+            )
+            regions.append((VIEW_TOGGLE, tx0, 6, tx0 + toggle_w, ty1))
+
     return bar, regions
 
 
@@ -86,7 +115,8 @@ def compose_track_display(
     vis: np.ndarray,
     hud_lines: list[str],
     mode: PlaybackMode,
-) -> tuple[np.ndarray, list[tuple[PlaybackMode, int, int, int, int]], int]:
+    view_mode: str | None = None,
+) -> tuple[np.ndarray, list[BarRegion], int]:
     overlay = vis.copy()
     y = 24
     for line in hud_lines:
@@ -100,7 +130,7 @@ def compose_track_display(
             2,
         )
         y += 26
-    bar, regions = draw_transport_bar(overlay.shape[1], mode)
+    bar, regions = draw_transport_bar(overlay.shape[1], mode, view_mode)
     return np.vstack([overlay, bar]), regions, overlay.shape[0]
 
 
@@ -108,8 +138,8 @@ def transport_hit(
     x: int,
     y: int,
     video_height: int,
-    regions: list[tuple[PlaybackMode, int, int, int, int]],
-) -> PlaybackMode | None:
+    regions: list[BarRegion],
+) -> "PlaybackMode | str | None":
     if y < video_height:
         return None
     y_in_bar = y - video_height
@@ -147,6 +177,14 @@ MAX_CELL_BOOST = 2.5  # an unmapped cell may take up to this multiple of the bas
 MIN_CELL_TRACKS = 4  # complete cells still keep a few tracks for pose estimation
 MIN_CELL_OBSERVATIONS = 5  # observations before a cell's saturation is trusted
 SATURATION_INTERVAL_SECONDS = 3.0  # how often finished map regions are thinned to anchors
+
+# Track churn ("scramble"): once the pose is held by plenty of tracks, retire a share of
+# the mature ones and re-seed into places that were not tracked before.
+CHURN_EVERY_COMMITS = 6  # pose updates (each means real camera motion) between churns
+CHURN_MIN_INLIERS = 300  # pose must be this well supported to churn
+CHURN_FRACTION = 0.25  # share of all tracks retired per churn
+CHURN_MIN_WEIGHT = 20.0  # only tracks whose landmark has matured are retired
+CHURN_CLEARANCE_PX = 15  # new corners keep this far from the retired ones
 
 
 def per_cell_target(target_total: int) -> int:
@@ -200,8 +238,13 @@ def detect_balanced(
     existing: np.ndarray | None,
     target_total: int,
     targets: np.ndarray | None = None,
+    avoid: np.ndarray | None = None,
+    refill_fraction: float = TRACK_REFILL_FRACTION,
 ) -> np.ndarray:
-    """Detect corners so every grid cell of the frame keeps a share of tracks."""
+    """Detect corners so every grid cell of the frame keeps a share of tracks.
+
+    `avoid` lists pixels (e.g. just-retired tracks) that new corners must keep clear of.
+    """
     height, width = gray.shape[:2]
     cols, rows = TRACK_GRID_COLS, TRACK_GRID_ROWS
     if targets is None:
@@ -224,6 +267,17 @@ def detect_balanced(
         yi = np.clip(np.round(pts[:, 1]).astype(int), 0, height - 1)
         free[yi, xi] = 0
         free = cv2.erode(free, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    if avoid is not None and len(avoid):
+        apts = avoid.reshape(-1, 2)
+        keep_clear = np.full((height, width), 255, np.uint8)
+        keep_clear[
+            np.clip(np.round(apts[:, 1]).astype(int), 0, height - 1),
+            np.clip(np.round(apts[:, 0]).astype(int), 0, width - 1),
+        ] = 0
+        keep_clear = cv2.erode(
+            keep_clear, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (CHURN_CLEARANCE_PX, CHURN_CLEARANCE_PX))
+        )
+        free = cv2.bitwise_and(free, keep_clear)
 
     pad = 4
     found: list[np.ndarray] = []
@@ -232,7 +286,7 @@ def detect_balanced(
         for c in range(cols):
             have = int(counts[r, c])
             per_cell = int(round(targets[r, c]))
-            if have >= per_cell * TRACK_REFILL_FRACTION:
+            if have >= per_cell * refill_fraction:
                 continue
             x0, x1 = c * width // cols, (c + 1) * width // cols
             ya, yb = max(0, y0 - pad), min(height, y1 + pad)
@@ -557,6 +611,29 @@ def parse_args() -> argparse.Namespace:
         "regions, fixed tracking budget per image cell)",
     )
     parser.add_argument(
+        "--no-mesh",
+        action="store_true",
+        help="do not build the coloured surface mesh (point cloud only)",
+    )
+    parser.add_argument(
+        "--start-mesh-view",
+        action="store_true",
+        help="open the 3D view in mesh mode (default: point mode; toggle with the View button)",
+    )
+    parser.add_argument(
+        "--export-mesh",
+        type=Path,
+        default=None,
+        metavar="BASE",
+        help="on exit write BASE.ply (coloured) and BASE.stl (geometry only)",
+    )
+    parser.add_argument(
+        "--no-churn",
+        action="store_true",
+        help="keep tracking the same points instead of periodically re-seeding into "
+        "untracked regions",
+    )
+    parser.add_argument(
         "--plot-every",
         type=int,
         default=3,
@@ -612,9 +689,11 @@ def main() -> None:
     key_birth_px = np.empty((0, 2), dtype=np.float64)
     key_birth_R = np.empty((0, 3, 3), dtype=np.float64)
     key_birth_C = np.empty((0, 3), dtype=np.float64)
+    key_gray: np.ndarray | None = None
 
-    def set_keyframe(points: np.ndarray, ids: np.ndarray) -> None:
-        nonlocal key_ids, key_pts, key_birth_px, key_birth_R, key_birth_C
+    def set_keyframe(points: np.ndarray, ids: np.ndarray, image: np.ndarray) -> None:
+        nonlocal key_ids, key_pts, key_birth_px, key_birth_R, key_birth_C, key_gray
+        key_gray = image
         order = np.argsort(ids)
         new_ids = ids[order]
         new_pts = points.reshape(-1, 2)[order].astype(np.float64)
@@ -633,7 +712,7 @@ def main() -> None:
         key_ids, key_pts = new_ids, new_pts.astype(np.float32)
         key_birth_px, key_birth_R, key_birth_C = birth_px, birth_R, birth_C
 
-    set_keyframe(track_points, track_ids)
+    set_keyframe(track_points, track_ids, gray)
 
     cache_dir = None if args.no_disk_cache else args.map_cache.expanduser().resolve()
     map_store = MapStore(
@@ -642,10 +721,14 @@ def main() -> None:
         max_live_points=args.max_live_points,
     )
 
+    mesh_builder = None if args.no_mesh else MeshBuilder(map_store)
     anchors = None if args.no_anchors else AnchorMap(max_anchors=args.max_anchors)
     stats = {
         "commits": 0, "fixes": 0, "associated": 0, "pruned": 0, "thinned": 0, "redundant": 0,
+        "churned": 0, "churns": 0, "mesh_tris": 0,
     }
+    churn_state = {"commits": 0, "inliers": 0}
+
     prune_state = {"last": 0.0, "saturate": 0.0}
     saturation_map = None if args.no_saturation else SaturationMap()
     cell_targets = np.full(
@@ -656,6 +739,9 @@ def main() -> None:
     map_height = max(320, height // 2)
     map_view = MapRenderer(width, map_height)
     map_view.setup_window()
+    map_view.set_mesh(mesh_builder)
+    if args.start_mesh_view and mesh_builder is not None:
+        map_view.view_mode = "mesh"
     layout_windows(width, height, map_height)
     map_view.show(trajectory, map_store)
 
@@ -665,7 +751,7 @@ def main() -> None:
     last_vis: np.ndarray | None = None
     video_fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
     play_delay_ms = max(1, int(round(1000.0 / video_fps)))
-    button_regions: list[tuple[PlaybackMode, int, int, int, int]] = []
+    button_regions: list[BarRegion] = []
     video_panel_height = height
     video_active = True
     map_finalized = False
@@ -679,7 +765,9 @@ def main() -> None:
                 f"live: {map_store.live_count}  stored: {map_store.archive_count}  "
                 f"anchors: {len(anchors) if anchors is not None else 0}  "
                 f"fixes: {stats['fixes']}  pruned: {stats['pruned']}  "
-                f"settled: {len(saturation_map) if saturation_map is not None else 0}"
+                f"settled: {len(saturation_map) if saturation_map is not None else 0}  "
+                f"faces: {len(mesh_builder) if mesh_builder is not None else 0}  "
+                f"churned: {stats['churned']}"
             ),
             f"time: {t_sec:.1f}s  frame: {int(capture.get(cv2.CAP_PROP_POS_FRAMES))}  ({mode_label})",
         ]
@@ -775,6 +863,8 @@ def main() -> None:
                     poses[moving] = correction.apply(poses[moving], fraction[moving])
                     trajectory[:] = [row.copy() for row in poses]
                     map_store.warp(correction, start, step)
+                    if mesh_builder is not None:
+                        mesh_builder.version += 1  # corners moved: rebuild the view
                     anchors.warp(correction, start, step)
                     anchors.last_fix_step = step
                     if saturation_map is not None:
@@ -829,7 +919,7 @@ def main() -> None:
                 next_track_id, next_track_id + len(track_points), dtype=np.int64
             )
             next_track_id += len(track_points)
-            set_keyframe(track_points, track_ids)
+            set_keyframe(track_points, track_ids, gray)
             prev_gray = gray
             processed += 1
             if processed % args.plot_every == 0:
@@ -845,6 +935,7 @@ def main() -> None:
         # Estimate motion against the keyframe (not the previous frame) so there is
         # enough parallax; nothing is committed until the camera has actually moved.
         rekey = False
+        committed = False
         pos = np.minimum(np.searchsorted(key_ids, good_ids), len(key_ids) - 1)
         matched = key_ids[pos] == good_ids
         if matched.sum() < KEYFRAME_MIN_MATCHES:
@@ -958,6 +1049,25 @@ def main() -> None:
                         map_store.add(obs_points, colors, obs_ids, weights, step, now=video_clock())
 
                     stats["commits"] += 1
+                    churn_state["commits"] += 1
+                    churn_state["inliers"] = len(inlier_ids)
+                    committed = True
+                    if mesh_builder is not None:
+                        found_m, pos_m, weight_m = map_store.lookup_all(inlier_ids)
+                        if found_m.sum() >= 12:
+                            stats["mesh_tris"] = mesh_builder.update(
+                                rotation=world_rotation,
+                                position=world_position,
+                                ids=inlier_ids[found_m],
+                                pixels=current_inlier[found_m],
+                                points=pos_m,
+                                weights=weight_m,
+                                gray=gray,
+                                key_gray=key_gray,
+                                key_ids=key_ids,
+                                key_pts=key_pts,
+                            )
+                        mesh_builder.purge(video_clock())
                     if anchors is not None and stats["commits"] % ANCHOR_INTERVAL == 0:
                         run_anchor_step(gray, inlier_ids, current_inlier)
 
@@ -1000,7 +1110,36 @@ def main() -> None:
             track_points, track_ids, width, height, args.max_features, cell_targets
         )
         track_points = flat_tracks.reshape(-1, 1, 2)
-        fresh = detect_balanced(gray, track_points, args.max_features, cell_targets)
+
+        # Churn: with the pose firmly held, retire the oldest mature tracks and re-seed
+        # elsewhere (keeping clear of where they were) so new ground gets covered.
+        retired_px = None
+        if (
+            committed
+            and not args.no_churn
+            and churn_state["commits"] >= CHURN_EVERY_COMMITS
+            and churn_state["inliers"] >= CHURN_MIN_INLIERS
+        ):
+            weight_now = map_store.lookup_weights(track_ids)
+            mature = np.flatnonzero(weight_now >= CHURN_MIN_WEIGHT)
+            n_retire = min(len(mature), int(CHURN_FRACTION * len(track_ids)))
+            if n_retire >= 20:
+                retire = mature[np.argsort(track_ids[mature])[:n_retire]]
+                keep_track = np.ones(len(track_ids), dtype=bool)
+                keep_track[retire] = False
+                retired_px = track_points.reshape(-1, 2)[retire]
+                track_points, track_ids = track_points[keep_track], track_ids[keep_track]
+                stats["churned"] += n_retire
+                stats["churns"] += 1
+                churn_state["commits"] = 0
+        fresh = detect_balanced(
+            gray,
+            track_points,
+            args.max_features,
+            cell_targets,
+            avoid=retired_px,
+            refill_fraction=1.0 if retired_px is not None else TRACK_REFILL_FRACTION,
+        )
         if len(fresh):
             fresh_ids = np.arange(
                 next_track_id, next_track_id + len(fresh), dtype=np.int64
@@ -1010,7 +1149,7 @@ def main() -> None:
             track_ids = np.concatenate([track_ids, fresh_ids])
 
         if rekey:
-            set_keyframe(track_points, track_ids)
+            set_keyframe(track_points, track_ids, gray)
 
         prev_gray = gray
         processed += 1
@@ -1025,6 +1164,7 @@ def main() -> None:
             vis,
             hud_lines(),
             playback_mode,
+            map_view.view_mode if mesh_builder is not None else None,
         )
         cv2.imshow(TRACK_WINDOW, display)
 
@@ -1033,10 +1173,28 @@ def main() -> None:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         choice = transport_hit(x, y, video_panel_height, button_regions)
-        if choice is not None:
+        if choice == VIEW_TOGGLE:
+            map_view.toggle_view_mode()
+            if last_vis is not None:
+                show_vis(last_vis)
+        elif choice is not None:
             playback_mode = choice
             if last_vis is not None:
                 show_vis(last_vis)
+
+    def export_mesh(base: Path) -> None:
+        if mesh_builder is None:
+            return
+        mesh_builder.purge(0.0, force=True)
+        vertices, colors, faces = mesh_builder.indexed_mesh()
+        if len(faces) == 0:
+            print("[mesh] nothing to export yet (no faces passed validation)")
+            return
+        base = base.expanduser().resolve()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        write_ply(base.with_suffix(".ply"), vertices, colors, faces)
+        write_stl(base.with_suffix(".stl"), vertices, faces)
+        print(f"[mesh] exported {len(faces)} faces / {len(vertices)} vertices to {base}.ply / .stl")
 
     def handle_frame(frame: np.ndarray) -> None:
         nonlocal frame_index
@@ -1047,7 +1205,10 @@ def main() -> None:
     print(f"Running SLAM on {video_path}")
     if args.max_seconds > 0:
         print(f"Video stops after {args.max_seconds:g}s (--max-seconds 0 for full video)")
-    print("Video: Rewind / Pause / Play buttons, space = pause/play, q = quit")
+    print(
+        "Video: Rewind / Pause / Play buttons, space = pause/play, q = quit, "
+        "m = toggle point/mesh view (or the View button), e = export mesh to 3D-SLAM/exports/"
+    )
     print(
         "Map window: LMB look around, MMB orbit, RMB pan, W/A/S/D fly, Space up, Ctrl down, "
         "Shift = 3x speed, scroll forward/back, Reset button top-left"
@@ -1073,6 +1234,14 @@ def main() -> None:
             key = cv2.waitKey(delay) & 0xFF
             if key == ord("q"):
                 break
+            if key == ord("m") and mesh_builder is not None:
+                map_view.toggle_view_mode()
+                if last_vis is not None:
+                    show_vis(last_vis)
+                continue
+            if key == ord("e"):
+                export_mesh(DEFAULT_EXPORT_DIR / datetime.now().strftime("mesh-%Y%m%d-%H%M%S"))
+                continue
             if key == ord(" "):
                 playback_mode = (
                     PlaybackMode.FORWARD
@@ -1120,11 +1289,17 @@ def main() -> None:
         cv2.destroyAllWindows()
         if not map_finalized:
             map_store.finalize()
+        if args.export_mesh is not None:
+            export_mesh(args.export_mesh)
+        if mesh_builder is not None:
+            mesh_builder.purge(0.0, force=True)
         print(
             f"[map] {len(map_store)} landmarks | settled anchors "
             f"{len(saturation_map) if saturation_map is not None else 0}, "
             f"thinned {stats['thinned']}, redundant skipped {stats['redundant']} | "
-            f"isolated pruned {stats['pruned']} | loop fixes {stats['fixes']}"
+            f"isolated pruned {stats['pruned']} | loop fixes {stats['fixes']} | "
+            f"mesh faces {len(mesh_builder) if mesh_builder is not None else 0} | "
+            f"churned {stats['churned']} in {stats['churns']} rounds"
         )
         map_view.show(trajectory, map_store)
         map_view.close()

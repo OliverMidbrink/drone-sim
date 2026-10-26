@@ -68,6 +68,37 @@ void main() {
 }
 """
 
+# Coloured triangles, flat-shaded with a headlight so relief reads without a light source.
+_MESH_VERTEX_SHADER = """
+#version 330 core
+in vec3 in_position;
+in vec3 in_color;
+in vec3 in_normal;
+uniform mat4 mvp;
+out vec3 v_color;
+out vec3 v_normal;
+out vec3 v_world;
+void main() {
+    gl_Position = mvp * vec4(in_position, 1.0);
+    v_color = in_color;
+    v_normal = in_normal;
+    v_world = in_position;
+}
+"""
+
+_MESH_FRAGMENT_SHADER = """
+#version 330 core
+in vec3 v_color;
+in vec3 v_normal;
+in vec3 v_world;
+uniform vec3 eye;
+out vec4 fragColor;
+void main() {
+    float facing = abs(dot(normalize(v_normal), normalize(eye - v_world)));
+    fragColor = vec4(v_color * (0.45 + 0.55 * facing), 1.0);
+}
+"""
+
 _MARKER_VERTEX_SHADER = """
 #version 330 core
 in vec3 in_position;
@@ -152,11 +183,19 @@ def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
     return rotation @ translation
 
 
+MESH_REBUILD_SECONDS = 0.5  # minimum time between mesh geometry uploads
+MESH_MAX_FACES = 400_000
+
+
 class MapRenderer:
     _RESET_X = 10
     _RESET_Y = 10
     _RESET_W = 86
     _RESET_H = 30
+    _VIEW_X = 104
+    _VIEW_Y = 10
+    _VIEW_W = 128
+    _VIEW_H = 30
 
     def __init__(self, width: int, height: int) -> None:
         self.logical_width = width
@@ -195,6 +234,26 @@ class MapRenderer:
         self._point_spacing: float | None = None
         self._spacing_time = 0.0
 
+        self.view_mode = "points"  # "points" | "mesh"
+        self._mesh = None  # MeshBuilder, set by the SLAM script
+        self._mesh_program: moderngl.Program | None = None
+        self._mesh_vbo: moderngl.Buffer | None = None
+        self._mesh_vertex_count = 0
+        self._mesh_built_version = -1
+        self._mesh_built_time = 0.0
+        self._view_textures: dict[str, moderngl.Texture] = {}
+        self._view_vbo: moderngl.Buffer | None = None
+
+    def set_mesh(self, mesh) -> None:
+        self._mesh = mesh
+
+    def toggle_view_mode(self) -> None:
+        if self._mesh is None:
+            return
+        self.view_mode = "mesh" if self.view_mode == "points" else "points"
+        self._mesh_built_version = -1  # force a rebuild when entering mesh mode
+        self.draw()
+
     def setup_window(self, margin_x: int = 40, margin_y: int = 40) -> None:
         if not glfw.init():
             raise SystemExit("GLFW failed to initialize (GPU map window unavailable).")
@@ -232,8 +291,13 @@ class MapRenderer:
             vertex_shader=_MARKER_VERTEX_SHADER,
             fragment_shader=_MARKER_FRAGMENT_SHADER,
         )
+        self._mesh_program = self._ctx.program(
+            vertex_shader=_MESH_VERTEX_SHADER,
+            fragment_shader=_MESH_FRAGMENT_SHADER,
+        )
         self._marker_vbo = self._ctx.buffer(reserve=12)
         self._setup_reset_button()
+        self._setup_view_button()
 
         glfw.set_framebuffer_size_callback(self._window, self._on_resize)
         glfw.set_mouse_button_callback(self._window, self._on_mouse_button)
@@ -281,6 +345,87 @@ class MapRenderer:
             dtype="f4",
         )
         self._ui_vbo = self._ctx.buffer(quad.tobytes())
+
+    def _setup_view_button(self) -> None:
+        assert self._ctx is not None
+        for mode, text in (("points", "View: Points"), ("mesh", "View: Mesh")):
+            label = np.zeros((self._VIEW_H, self._VIEW_W, 3), dtype=np.uint8)
+            label[:] = (48, 48, 52) if mode == "points" else (70, 120, 80)
+            cv2.rectangle(label, (0, 0), (self._VIEW_W - 1, self._VIEW_H - 1), (90, 90, 98), 1)
+            cv2.putText(
+                label, text, (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (230, 230, 235), 1, cv2.LINE_AA,
+            )
+            rgb = cv2.cvtColor(label, cv2.COLOR_BGR2RGB)
+            texture = self._ctx.texture((self._VIEW_W, self._VIEW_H), 3, rgb.tobytes())
+            texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._view_textures[mode] = texture
+
+        x0, y0 = self._VIEW_X, self._VIEW_Y
+        x1, y1 = x0 + self._VIEW_W, y0 + self._VIEW_H
+        quad = np.array(
+            [x0, y0, 0.0, 0.0, x1, y0, 1.0, 0.0, x0, y1, 0.0, 1.0, x1, y1, 1.0, 1.0],
+            dtype="f4",
+        )
+        self._view_vbo = self._ctx.buffer(quad.tobytes())
+
+    def _in_view_button(self, x: float, y: float) -> bool:
+        return (
+            self._mesh is not None
+            and self._VIEW_X <= x <= self._VIEW_X + self._VIEW_W
+            and self._VIEW_Y <= y <= self._VIEW_Y + self._VIEW_H
+        )
+
+    def _draw_view_button(self) -> None:
+        if (
+            self._mesh is None
+            or self._ctx is None
+            or self._ui_program is None
+            or self._view_vbo is None
+            or self._window is None
+        ):
+            return
+        win_w, win_h = glfw.get_window_size(self._window)
+        self._ctx.disable(moderngl.DEPTH_TEST)
+        self._view_textures[self.view_mode].use(0)
+        self._ui_program["u_texture"].value = 0
+        self._ui_program["u_resolution"].value = (float(win_w), float(win_h))
+        vao = self._ctx.vertex_array(
+            self._ui_program, [(self._view_vbo, "2f 2f", "in_position", "in_uv")]
+        )
+        vao.render(moderngl.TRIANGLE_STRIP)
+        vao.release()
+
+    def _upload_mesh(self) -> None:
+        """Rebuild the triangle buffer when the mesh changed (throttled)."""
+        assert self._ctx is not None
+        if self._mesh is None or self._map_store is None:
+            self._mesh_vertex_count = 0
+            return
+        now = time.monotonic()
+        stale = self._mesh.version != self._mesh_built_version
+        if not stale or (
+            self._mesh_built_version >= 0 and now - self._mesh_built_time < MESH_REBUILD_SECONDS
+        ):
+            return
+        self._mesh_built_version = self._mesh.version
+        self._mesh_built_time = now
+
+        pos, col, normal = self._mesh.mesh_arrays(MESH_MAX_FACES)
+        if len(pos) == 0:
+            self._mesh_vertex_count = 0
+            return
+        pos = pos * SLAM_TO_VIEW
+        normal = np.repeat((normal * SLAM_TO_VIEW)[:, None, :], 3, axis=1)
+        data = np.concatenate([pos, col, normal], axis=2).astype("f4")  # (F, 3, 9)
+        raw = data.tobytes()
+        if self._mesh_vbo is None or self._mesh_vbo.size < len(raw):
+            if self._mesh_vbo is not None:
+                self._mesh_vbo.release()
+            self._mesh_vbo = self._ctx.buffer(raw)
+        else:
+            self._mesh_vbo.write(raw)
+        self._mesh_vertex_count = len(pos) * 3
 
     def _target(self) -> np.ndarray:
         return self.focus + self.pan
@@ -335,6 +480,9 @@ class MapRenderer:
             if self._in_reset_button(x, y):
                 self.reset_view()
                 self.draw()
+                return
+            if self._in_view_button(x, y):
+                self.toggle_view_mode()
                 return
             self._orbit_drag = True
             self._orbit_around_target = False
@@ -474,7 +622,11 @@ class MapRenderer:
 
         mvp = projection @ view
         self._program["mvp"].write(mvp.astype(np.float32).T.tobytes())
-        self._update_point_spacing(self._render_points)
+        mesh_mode = self.view_mode == "mesh" and self._mesh is not None
+        if mesh_mode:
+            self._upload_mesh()
+        else:
+            self._update_point_spacing(self._render_points)
         spacing = self._point_spacing if self._point_spacing is not None else 0.0
         focal_px = fb_h / (2.0 * np.tan(np.radians(PROJECTION_FOV_Y_DEG) / 2.0))
         self._program["splat_world_size"].value = float(spacing * SPLAT_SPACING_FACTOR)
@@ -492,7 +644,17 @@ class MapRenderer:
             path_vao.render(moderngl.LINE_STRIP, vertices=self._path_count)
             path_vao.release()
 
-        if self._point_vbo is not None and self._point_count > 0:
+        if mesh_mode:
+            if self._mesh_vbo is not None and self._mesh_vertex_count > 0:
+                self._mesh_program["mvp"].write(mvp.astype(np.float32).T.tobytes())
+                self._mesh_program["eye"].value = tuple(float(v) for v in eye)
+                mesh_vao = self._ctx.vertex_array(
+                    self._mesh_program,
+                    [(self._mesh_vbo, "3f 3f 3f", "in_position", "in_color", "in_normal")],
+                )
+                mesh_vao.render(moderngl.TRIANGLES, vertices=self._mesh_vertex_count)
+                mesh_vao.release()
+        elif self._point_vbo is not None and self._point_count > 0:
             point_vao = self._ctx.vertex_array(
                 self._program,
                 [(self._point_vbo, "3f 3f", "in_position", "in_color")],
@@ -504,6 +666,7 @@ class MapRenderer:
             self._draw_camera_marker(traj[-1], mvp)
 
         self._draw_reset_button()
+        self._draw_view_button()
 
         glfw.swap_buffers(self._window)
 
@@ -679,6 +842,12 @@ class MapRenderer:
             self._marker_vbo.release()
         if self._reset_texture is not None:
             self._reset_texture.release()
+        for texture in self._view_textures.values():
+            texture.release()
+        if self._view_vbo is not None:
+            self._view_vbo.release()
+        if self._mesh_vbo is not None:
+            self._mesh_vbo.release()
         if self._window is not None:
             glfw.destroy_window(self._window)
         glfw.terminate()
