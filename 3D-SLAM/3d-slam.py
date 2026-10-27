@@ -2,6 +2,7 @@
 """Monocular video SLAM: sparse map + camera trajectory (metric scale arbitrary)."""
 
 import argparse
+import sys
 from enum import IntEnum
 from datetime import datetime
 from pathlib import Path
@@ -25,8 +26,18 @@ from saturation import SaturationMap
 DEFAULT_VIDEO = (
     Path(__file__).resolve().parent / "video-samples" / "forest-walking.mp4"
 )
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 DEFAULT_MAP_CACHE = Path(__file__).resolve().parent / ".map-cache"
 DEFAULT_EXPORT_DIR = Path(__file__).resolve().parent / "exports"
+
+# Regions ignored by SLAM, keyed by video filename. Each box is normalized frame
+# coordinates (x0, y0, x1, y1) with y downward — e.g. a bottom-left 25%×25% square is
+# (0.0, 0.75, 0.25, 1.0). The industrial drone video's controller-cam overlay measures
+# ~26% wide × ~35% tall, so its box is (0.0, 0.64, 0.27, 1.0).
+VIDEO_EXCLUDE_BOXES: dict[str, list[tuple[float, float, float, float]]] = {
+    "drone-flying-industrial.mp4": [(0.0, 0.64, 0.27, 1.0)],
+    "drone-flying-industrial-cut.mp4": [(0.0, 0.64, 0.27, 1.0)],
+}
 
 LK_PARAMS = dict(
     winSize=(21, 21),
@@ -149,6 +160,46 @@ def transport_hit(
     return None
 
 
+def exclude_boxes_for_video(video_path: Path) -> list[tuple[float, float, float, float]]:
+    return list(VIDEO_EXCLUDE_BOXES.get(video_path.name, ()))
+
+
+def exclude_mask_for_boxes(
+    width: int, height: int, boxes: list[tuple[float, float, float, float]]
+) -> np.ndarray | None:
+    """Feature-detection mask: 255 = allowed, 0 = excluded."""
+    if not boxes:
+        return None
+    mask = np.full((height, width), 255, np.uint8)
+    for x0, y0, x1, y1 in boxes:
+        xa, xb = int(np.floor(x0 * width)), int(np.ceil(x1 * width))
+        ya, yb = int(np.floor(y0 * height)), int(np.ceil(y1 * height))
+        mask[ya:yb, xa:xb] = 0
+    return mask
+
+
+def points_outside_exclude(
+    points: np.ndarray,
+    boxes: list[tuple[float, float, float, float]],
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """True where a point lies outside every exclude box."""
+    if not boxes or len(points) == 0:
+        return np.ones(len(points.reshape(-1, 2)), dtype=bool)
+    flat = points.reshape(-1, 2)
+    ok = np.ones(len(flat), dtype=bool)
+    for x0, y0, x1, y1 in boxes:
+        inside = (
+            (flat[:, 0] >= x0 * width)
+            & (flat[:, 0] < x1 * width)
+            & (flat[:, 1] >= y0 * height)
+            & (flat[:, 1] < y1 * height)
+        )
+        ok &= ~inside
+    return ok
+
+
 def camera_matrix(width: int, height: int, fov_deg: float | None = None) -> np.ndarray:
     if fov_deg is None:
         focal = 0.9 * width
@@ -240,6 +291,7 @@ def detect_balanced(
     targets: np.ndarray | None = None,
     avoid: np.ndarray | None = None,
     refill_fraction: float = TRACK_REFILL_FRACTION,
+    exclude_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Detect corners so every grid cell of the frame keeps a share of tracks.
 
@@ -258,6 +310,8 @@ def detect_balanced(
 
     counts = np.zeros((rows, cols), dtype=np.int32)
     free = np.full((height, width), 255, np.uint8)
+    if exclude_mask is not None:
+        free = cv2.bitwise_and(free, exclude_mask)
     if len(pts):
         cx = np.clip((pts[:, 0] * cols / width).astype(int), 0, cols - 1)
         cy = np.clip((pts[:, 1] * rows / height).astype(int), 0, rows - 1)
@@ -318,6 +372,7 @@ def track_features(
     gray: np.ndarray,
     points: np.ndarray,
     fb_max_px: float = 0.0,
+    exclude_boxes: list[tuple[float, float, float, float]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """LK tracking; a point is kept while LK finds it and it stays in the frame.
 
@@ -336,6 +391,8 @@ def track_features(
         & (flat[:, 1] >= 0)
         & (flat[:, 1] < height - 1)
     )
+    if exclude_boxes:
+        keep &= points_outside_exclude(forward, exclude_boxes, width, height)
     if fb_max_px > 0 and keep.any():
         backward, status_b, _ = cv2.calcOpticalFlowPyrLK(
             gray, prev_gray, forward, None, **LK_PARAMS
@@ -478,8 +535,20 @@ def sample_colors(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
     return bgr[:, ::-1].astype(np.float64) / 255.0
 
 
-def draw_tracks(image: np.ndarray, points: np.ndarray) -> np.ndarray:
+def draw_tracks(
+    image: np.ndarray,
+    points: np.ndarray,
+    exclude_boxes: list[tuple[float, float, float, float]] | None = None,
+) -> np.ndarray:
     vis = image.copy()
+    if exclude_boxes:
+        height, width = vis.shape[:2]
+        for x0, y0, x1, y1 in exclude_boxes:
+            xa, xb = int(x0 * width), int(x1 * width)
+            ya, yb = int(y0 * height), int(y1 * height)
+            region = vis[ya:yb, xa:xb]
+            vis[ya:yb, xa:xb] = (region.astype(np.float32) * 0.35).astype(np.uint8)
+            cv2.rectangle(vis, (xa, ya), (max(xa, xb - 1), max(ya, yb - 1)), (90, 90, 98), 1)
     for x, y in points.reshape(-1, 2):
         cv2.circle(vis, (int(round(x)), int(round(y))), 2, (0, 255, 0), -1)
     return vis
@@ -512,8 +581,8 @@ def parse_args() -> argparse.Namespace:
         "video",
         nargs="?",
         type=Path,
-        default=DEFAULT_VIDEO,
-        help=f"path to input video (default: {DEFAULT_VIDEO})",
+        default=None,
+        help="path to input video; if omitted you pick one from video-samples/ by number",
     )
     parser.add_argument(
         "--scale",
@@ -642,9 +711,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def choose_video() -> Path:
+    """List the videos in video-samples/ and let the user pick one by number."""
+    samples = sorted(
+        p for p in DEFAULT_VIDEO.parent.glob("*") if p.suffix.lower() in VIDEO_SUFFIXES
+    )
+    if not samples:
+        raise SystemExit(f"No sample videos found in {DEFAULT_VIDEO.parent}")
+    default_index = samples.index(DEFAULT_VIDEO) + 1 if DEFAULT_VIDEO in samples else 1
+    if not sys.stdin.isatty():
+        return samples[default_index - 1]
+
+    print("Available videos:")
+    for number, path in enumerate(samples, start=1):
+        size_mb = path.stat().st_size / 1e6
+        tag = "  (default)" if number == default_index else ""
+        print(f"  {number}) {path.name}  [{size_mb:.0f} MB]{tag}")
+    while True:
+        try:
+            answer = input(f"Choose a video [1-{len(samples)}, Enter={default_index}, q=quit]: ")
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\nNo video selected")
+        answer = answer.strip().lower()
+        if answer in ("q", "quit"):
+            raise SystemExit("No video selected")
+        if not answer:
+            return samples[default_index - 1]
+        if answer.isdigit() and 1 <= int(answer) <= len(samples):
+            return samples[int(answer) - 1]
+        print(f"  Please enter a number from 1 to {len(samples)}.")
+
+
 def main() -> None:
     args = parse_args()
-    video_path = args.video.expanduser().resolve()
+    video_path = (args.video or choose_video()).expanduser().resolve()
     if not video_path.is_file():
         raise SystemExit(f"Video not found: {video_path}")
 
@@ -666,13 +766,22 @@ def main() -> None:
         )
 
     height, width = frame.shape[:2]
+    exclude_boxes = exclude_boxes_for_video(video_path)
+    exclude_mask = exclude_mask_for_boxes(width, height, exclude_boxes)
     intrinsic = camera_matrix(width, height, args.fov_deg)
     fx = intrinsic[0, 0]
     print(f"Camera intrinsics: horizontal FOV {args.fov_deg:g}° -> fx={fx:.1f}px")
+    if exclude_boxes:
+        print(
+            f"SLAM ignores {len(exclude_boxes)} on-screen region(s) for {video_path.name} "
+            f"(see VIDEO_EXCLUDE_BOXES in 3d-slam.py)"
+        )
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     prev_gray = gray
-    track_points = detect_balanced(gray, None, args.max_features)
+    track_points = detect_balanced(
+        gray, None, args.max_features, exclude_mask=exclude_mask
+    )
     track_ids = np.arange(len(track_points), dtype=np.int64)
     next_track_id = len(track_points)
 
@@ -837,6 +946,13 @@ def main() -> None:
         """Relocalise against old anchors (closing loops), then add new anchors."""
         nonlocal world_rotation, world_position, key_ids
         keypoints, descriptors, response = anchors.detect(gray)
+        if exclude_boxes:
+            allowed = points_outside_exclude(keypoints, exclude_boxes, width, height)
+            keypoints, descriptors, response = (
+                keypoints[allowed],
+                descriptors[allowed],
+                response[allowed],
+            )
         if len(keypoints) == 0:
             return
         step = len(trajectory) - 1
@@ -914,7 +1030,9 @@ def main() -> None:
         nonlocal world_rotation, world_position, trajectory, last_step_length
 
         if len(track_points) < 8:
-            track_points = detect_balanced(gray, None, args.max_features)
+            track_points = detect_balanced(
+                gray, None, args.max_features, exclude_mask=exclude_mask
+            )
             track_ids = np.arange(
                 next_track_id, next_track_id + len(track_points), dtype=np.int64
             )
@@ -924,10 +1042,10 @@ def main() -> None:
             processed += 1
             if processed % args.plot_every == 0:
                 map_view.show(trajectory, map_store)
-            return draw_tracks(frame, track_points)
+            return draw_tracks(frame, track_points, exclude_boxes)
 
         next_points, keep = track_features(
-            prev_gray, gray, track_points, args.fb_check
+            prev_gray, gray, track_points, args.fb_check, exclude_boxes
         )
         good_current = next_points[keep]
         good_ids = track_ids[keep]
@@ -953,153 +1071,160 @@ def main() -> None:
                     rekey = parallax > 4.0 * KEYFRAME_MIN_PARALLAX_PX
                 else:
                     rotation, translation, inliers = motion
-                    key_inlier = key_matched[inliers]
-                    current_inlier = current_matched[inliers]
-                    inlier_ids = ids_matched[inliers]
-                    inlier_rows = pos[matched][inliers]
-
-                    # Step length: the essential matrix only gives direction, so anchor
-                    # the scale to landmarks already in the map. This keeps the scale
-                    # consistent from step to step instead of resetting it every time.
-                    unit_points = triangulate_pair(
-                        intrinsic, rotation, translation, key_inlier, current_inlier
-                    )
-                    scale = None
-                    map_store.reactivate_in_view(
-                        world_rotation, world_position, intrinsic, width, height
-                    )
-                    found, landmarks = map_store.lookup(inlier_ids)
-                    if found.sum() >= MIN_SCALE_MATCHES:
-                        depth_unit = unit_points[found, 2]
-                        depth_map = ((landmarks - world_position) @ world_rotation)[:, 2]
-                        usable = (depth_unit > 1e-3) & (depth_map > 1e-3)
-                        if usable.sum() >= MIN_SCALE_MATCHES:
-                            scale = float(np.median(depth_map[usable] / depth_unit[usable]))
-                    if scale is None:
-                        scale = (
-                            last_step_length
-                            if last_step_length is not None
-                            else triangulation_scale(unit_points)
+                    if exclude_boxes:
+                        inliers &= points_outside_exclude(
+                            current_matched, exclude_boxes, width, height
                         )
-                    if last_step_length is not None:
-                        scale = float(
-                            np.clip(scale, last_step_length / 4.0, last_step_length * 4.0)
+                    if inliers.sum() < 8:
+                        rekey = parallax > 4.0 * KEYFRAME_MIN_PARALLAX_PX
+                    else:
+                        key_inlier = key_matched[inliers]
+                        current_inlier = current_matched[inliers]
+                        inlier_ids = ids_matched[inliers]
+                        inlier_rows = pos[matched][inliers]
+
+                        # Step length: the essential matrix only gives direction, so anchor
+                        # the scale to landmarks already in the map. This keeps the scale
+                        # consistent from step to step instead of resetting it every time.
+                        unit_points = triangulate_pair(
+                            intrinsic, rotation, translation, key_inlier, current_inlier
                         )
-
-                    camera_delta = -(rotation.T @ (translation.reshape(3) * scale))
-                    world_position = world_position + world_rotation @ camera_delta
-                    world_rotation = world_rotation @ rotation.T
-                    last_step_length = float(np.linalg.norm(camera_delta))
-                    trajectory.append(world_position.copy())
-
-                    # Triangulate from each track's first sighting to now: the baseline
-                    # keeps growing as the camera moves, so distant and straight-ahead
-                    # points sharpen over time instead of staying noisy.
-                    rays_birth = pixel_rays(
-                        key_birth_px[inlier_rows], intrinsic, key_birth_R[inlier_rows]
-                    )
-                    rays_now = pixel_rays(current_inlier, intrinsic, world_rotation)
-                    points_world, angle_deg, usable = triangulate_midpoint(
-                        key_birth_C[inlier_rows],
-                        rays_birth,
-                        np.broadcast_to(world_position, (len(rays_now), 3)),
-                        rays_now,
-                    )
-                    step = len(trajectory) - 1
-                    if usable.any():
-                        weights = np.clip(angle_deg[usable] ** 2, 0.01, MAX_OBSERVATION_WEIGHT)
-                        colors = sample_colors(frame, current_inlier[usable])
-                        obs_ids = inlier_ids[usable]
-                        obs_points = points_world[usable]
-                        obs_pixels = current_inlier[usable]
-
-                        # Tracks that are new but sit on a landmark we already have
-                        # (e.g. returning to an area) adopt that landmark's id, so
-                        # their observations refine it rather than duplicating it.
-                        known, _ = map_store.lookup(obs_ids)
-                        fresh = np.flatnonzero(~known)
-                        if len(fresh):
-                            hit, target = map_store.find_existing(
-                                obs_points[fresh],
-                                obs_pixels[fresh],
-                                world_rotation,
-                                world_position,
-                                intrinsic,
-                                width,
-                                height,
-                                exclude_ids=good_ids,
+                        scale = None
+                        map_store.reactivate_in_view(
+                            world_rotation, world_position, intrinsic, width, height
+                        )
+                        found, landmarks = map_store.lookup(inlier_ids)
+                        if found.sum() >= MIN_SCALE_MATCHES:
+                            depth_unit = unit_points[found, 2]
+                            depth_map = ((landmarks - world_position) @ world_rotation)[:, 2]
+                            usable = (depth_unit > 1e-3) & (depth_map > 1e-3)
+                            if usable.sum() >= MIN_SCALE_MATCHES:
+                                scale = float(np.median(depth_map[usable] / depth_unit[usable]))
+                        if scale is None:
+                            scale = (
+                                last_step_length
+                                if last_step_length is not None
+                                else triangulation_scale(unit_points)
                             )
-                            if hit.any():
-                                source = obs_ids[fresh][hit]
-                                obs_ids = remap_ids(obs_ids, source, target[hit])
-                                inlier_ids = remap_ids(inlier_ids, source, target[hit])
-                                good_ids = remap_ids(good_ids, source, target[hit])
-                                stats["associated"] += int(hit.sum())
-                        if saturation_map is not None and len(obs_points):
-                            distance = np.linalg.norm(obs_points - world_position, axis=1)
-                            settled = saturation_map.settled(map_store, obs_points, distance)
-                            update_cell_targets(obs_pixels, settled)
-                            known_now, _ = map_store.lookup(obs_ids)
-                            redundant = settled & ~known_now  # complete region: nothing new to add
-                            if redundant.any():
-                                stats["redundant"] += int(redundant.sum())
-                                fresh_only = ~redundant
-                                obs_points, colors = obs_points[fresh_only], colors[fresh_only]
-                                obs_ids, weights = obs_ids[fresh_only], weights[fresh_only]
-                        map_store.add(obs_points, colors, obs_ids, weights, step, now=video_clock())
-
-                    stats["commits"] += 1
-                    churn_state["commits"] += 1
-                    churn_state["inliers"] = len(inlier_ids)
-                    committed = True
-                    if mesh_builder is not None:
-                        found_m, pos_m, weight_m = map_store.lookup_all(inlier_ids)
-                        if found_m.sum() >= 12:
-                            stats["mesh_tris"] = mesh_builder.update(
-                                rotation=world_rotation,
-                                position=world_position,
-                                ids=inlier_ids[found_m],
-                                pixels=current_inlier[found_m],
-                                points=pos_m,
-                                weights=weight_m,
-                                gray=gray,
-                                key_gray=key_gray,
-                                key_ids=key_ids,
-                                key_pts=key_pts,
+                        if last_step_length is not None:
+                            scale = float(
+                                np.clip(scale, last_step_length / 4.0, last_step_length * 4.0)
                             )
-                        mesh_builder.purge(video_clock())
-                    if anchors is not None and stats["commits"] % ANCHOR_INTERVAL == 0:
-                        run_anchor_step(gray, inlier_ids, current_inlier)
-
-                    clock = video_clock()
-                    if args.prune_age > 0 and clock - prune_state["last"] >= PRUNE_INTERVAL_SECONDS:
-                        prune_state["last"] = clock
-                        stats["pruned"] += map_store.prune_isolated(
-                            clock,
-                            np.asarray(trajectory),
-                            args.prune_age,
-                            args.prune_isolation,
-                            check_window=2.0 * PRUNE_INTERVAL_SECONDS,
-                            exempt_ids=None if saturation_map is None else saturation_map.anchor_ids,
+    
+                        camera_delta = -(rotation.T @ (translation.reshape(3) * scale))
+                        world_position = world_position + world_rotation @ camera_delta
+                        world_rotation = world_rotation @ rotation.T
+                        last_step_length = float(np.linalg.norm(camera_delta))
+                        trajectory.append(world_position.copy())
+    
+                        # Triangulate from each track's first sighting to now: the baseline
+                        # keeps growing as the camera moves, so distant and straight-ahead
+                        # points sharpen over time instead of staying noisy.
+                        rays_birth = pixel_rays(
+                            key_birth_px[inlier_rows], intrinsic, key_birth_R[inlier_rows]
                         )
-                    if (
-                        saturation_map is not None
-                        and clock - prune_state["saturate"] >= SATURATION_INTERVAL_SECONDS
-                    ):
-                        prune_state["saturate"] = clock
-                        _, thinned = saturation_map.consolidate(
-                            map_store, clock, np.asarray(trajectory)
+                        rays_now = pixel_rays(current_inlier, intrinsic, world_rotation)
+                        points_world, angle_deg, usable = triangulate_midpoint(
+                            key_birth_C[inlier_rows],
+                            rays_birth,
+                            np.broadcast_to(world_position, (len(rays_now), 3)),
+                            rays_now,
                         )
-                        stats["thinned"] += thinned
-
-                    map_store.archive_out_of_walker_view(
-                        world_rotation,
-                        world_position,
-                        intrinsic,
-                        width,
-                        height,
-                    )
-                    rekey = True
+                        step = len(trajectory) - 1
+                        if usable.any():
+                            weights = np.clip(angle_deg[usable] ** 2, 0.01, MAX_OBSERVATION_WEIGHT)
+                            colors = sample_colors(frame, current_inlier[usable])
+                            obs_ids = inlier_ids[usable]
+                            obs_points = points_world[usable]
+                            obs_pixels = current_inlier[usable]
+    
+                            # Tracks that are new but sit on a landmark we already have
+                            # (e.g. returning to an area) adopt that landmark's id, so
+                            # their observations refine it rather than duplicating it.
+                            known, _ = map_store.lookup(obs_ids)
+                            fresh = np.flatnonzero(~known)
+                            if len(fresh):
+                                hit, target = map_store.find_existing(
+                                    obs_points[fresh],
+                                    obs_pixels[fresh],
+                                    world_rotation,
+                                    world_position,
+                                    intrinsic,
+                                    width,
+                                    height,
+                                    exclude_ids=good_ids,
+                                )
+                                if hit.any():
+                                    source = obs_ids[fresh][hit]
+                                    obs_ids = remap_ids(obs_ids, source, target[hit])
+                                    inlier_ids = remap_ids(inlier_ids, source, target[hit])
+                                    good_ids = remap_ids(good_ids, source, target[hit])
+                                    stats["associated"] += int(hit.sum())
+                            if saturation_map is not None and len(obs_points):
+                                distance = np.linalg.norm(obs_points - world_position, axis=1)
+                                settled = saturation_map.settled(map_store, obs_points, distance)
+                                update_cell_targets(obs_pixels, settled)
+                                known_now, _ = map_store.lookup(obs_ids)
+                                redundant = settled & ~known_now  # complete region: nothing new to add
+                                if redundant.any():
+                                    stats["redundant"] += int(redundant.sum())
+                                    fresh_only = ~redundant
+                                    obs_points, colors = obs_points[fresh_only], colors[fresh_only]
+                                    obs_ids, weights = obs_ids[fresh_only], weights[fresh_only]
+                            map_store.add(obs_points, colors, obs_ids, weights, step, now=video_clock())
+    
+                        stats["commits"] += 1
+                        churn_state["commits"] += 1
+                        churn_state["inliers"] = len(inlier_ids)
+                        committed = True
+                        if mesh_builder is not None:
+                            found_m, pos_m, weight_m = map_store.lookup_all(inlier_ids)
+                            if found_m.sum() >= 12:
+                                stats["mesh_tris"] = mesh_builder.update(
+                                    rotation=world_rotation,
+                                    position=world_position,
+                                    ids=inlier_ids[found_m],
+                                    pixels=current_inlier[found_m],
+                                    points=pos_m,
+                                    weights=weight_m,
+                                    gray=gray,
+                                    key_gray=key_gray,
+                                    key_ids=key_ids,
+                                    key_pts=key_pts,
+                                )
+                            mesh_builder.purge(video_clock())
+                        if anchors is not None and stats["commits"] % ANCHOR_INTERVAL == 0:
+                            run_anchor_step(gray, inlier_ids, current_inlier)
+    
+                        clock = video_clock()
+                        if args.prune_age > 0 and clock - prune_state["last"] >= PRUNE_INTERVAL_SECONDS:
+                            prune_state["last"] = clock
+                            stats["pruned"] += map_store.prune_isolated(
+                                clock,
+                                np.asarray(trajectory),
+                                args.prune_age,
+                                args.prune_isolation,
+                                check_window=2.0 * PRUNE_INTERVAL_SECONDS,
+                                exempt_ids=None if saturation_map is None else saturation_map.anchor_ids,
+                            )
+                        if (
+                            saturation_map is not None
+                            and clock - prune_state["saturate"] >= SATURATION_INTERVAL_SECONDS
+                        ):
+                            prune_state["saturate"] = clock
+                            _, thinned = saturation_map.consolidate(
+                                map_store, clock, np.asarray(trajectory)
+                            )
+                            stats["thinned"] += thinned
+    
+                        map_store.archive_out_of_walker_view(
+                            world_rotation,
+                            world_position,
+                            intrinsic,
+                            width,
+                            height,
+                        )
+                        rekey = True
 
         track_points = good_current.reshape(-1, 1, 2)
         track_ids = good_ids
@@ -1139,6 +1264,7 @@ def main() -> None:
             cell_targets,
             avoid=retired_px,
             refill_fraction=1.0 if retired_px is not None else TRACK_REFILL_FRACTION,
+            exclude_mask=exclude_mask,
         )
         if len(fresh):
             fresh_ids = np.arange(
@@ -1148,6 +1274,10 @@ def main() -> None:
             track_points = np.vstack([track_points, fresh])
             track_ids = np.concatenate([track_ids, fresh_ids])
 
+        if exclude_boxes and len(track_points):
+            allowed = points_outside_exclude(track_points, exclude_boxes, width, height)
+            track_points, track_ids = track_points[allowed], track_ids[allowed]
+
         if rekey:
             set_keyframe(track_points, track_ids, gray)
 
@@ -1155,7 +1285,7 @@ def main() -> None:
         processed += 1
         if processed % args.plot_every == 0:
             map_view.show(trajectory, map_store)
-        return draw_tracks(frame, track_points)
+        return draw_tracks(frame, track_points, exclude_boxes)
 
     def show_vis(vis: np.ndarray) -> None:
         nonlocal last_vis, button_regions, video_panel_height
@@ -1219,7 +1349,7 @@ def main() -> None:
     )
 
     cv2.setMouseCallback(TRACK_WINDOW, on_track_mouse)
-    show_vis(draw_tracks(frame, track_points))
+    show_vis(draw_tracks(frame, track_points, exclude_boxes))
 
     try:
         while True:
