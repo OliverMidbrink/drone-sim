@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+from collections import deque
 from enum import IntEnum
 from datetime import datetime
 from pathlib import Path
@@ -11,33 +12,73 @@ import cv2
 import numpy as np
 
 from anchor_map import (
+    GUIDED_MIN_INLIERS,
+    GUIDED_MIN_MATCHES,
+    GUIDED_RADIUS_FRACTION,
     MIN_AGE_STEPS,
     NEW_VIEW_DEG,
     SAME_POINT_TOL,
     AnchorMap,
+    PoseFix,
     correction_between,
     keypoint_depths,
 )
+from camera_calibration import Undistorter, load_rays
 from map_renderer import MAP_WINDOW, MapRenderer
+from motion_deviation import DeviationMeter, MotionSample
 from map_store import MapStore
 from mesh_builder import MeshBuilder, write_ply, write_stl
 from saturation import SaturationMap
 
-DEFAULT_VIDEO = (
-    Path(__file__).resolve().parent / "video-samples" / "forest-walking.mp4"
-)
-VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
-DEFAULT_MAP_CACHE = Path(__file__).resolve().parent / ".map-cache"
-DEFAULT_EXPORT_DIR = Path(__file__).resolve().parent / "exports"
+SAMPLES_DIR = Path(__file__).resolve().parent / "video-samples"
+VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+DEVIATION_WINDOW = "Motion deviation"
+DEVIATION_WIDTH = 720  # displayed width of the deviation window
+DEFAULT_VIDEO = SAMPLES_DIR / "forest-walking.mp4"
 
-# Regions ignored by SLAM, keyed by video filename. Each box is normalized frame
-# coordinates (x0, y0, x1, y1) with y downward — e.g. a bottom-left 25%×25% square is
-# (0.0, 0.75, 0.25, 1.0). The industrial drone video's controller-cam overlay measures
-# ~26% wide × ~35% tall, so its box is (0.0, 0.64, 0.27, 1.0).
-VIDEO_EXCLUDE_BOXES: dict[str, list[tuple[float, float, float, float]]] = {
+# Image regions SLAM must ignore for a given sample (overlays, watermarks, the drone's
+# own body). Boxes are fractions of the frame: (x0, y0, x1, y1), origin top-left.
+# Looked up by file name; videos not listed here are used whole.
+# Tracking profiles. "legacy" is the original behaviour (kept for the forest video, where
+# the tuned profile felt unstable); "tuned" was tuned on the drone clip with forward/reverse
+# benchmarks. Videos not listed in VIDEO_PROFILE use "legacy".
+#   guided         pose-guided anchor matching on every pose update
+#   robust_anchors AP3P pose solver + trusting strong fixes + skipping trivial ones
+#   scale_window   recent steps whose median bounds the next step's scale (1 = last step only)
+#   scale_ratio    allowed factor above/below that reference
+#   robust_pose    repair essential-matrix poses whose rotation contradicts the observed flow
+#   map_scale      scale each step from landmark depths (False: from that step's scene depth,
+#                  which cannot feed back into itself and so does not run away over time)
+#   carry_scale    without a usable map scale, reuse the recent speed (True) or take the
+#                  scene depth of this step alone (False); optional, default True
+# "drone" is the experimental profile for the FPV clip: "tuned" plus whatever is being
+# explored for it. "legacy" and "tuned" are never changed by that work.
+# "pure" has no clamping and no carried-over speed: each step is scaled by the map's landmark
+# depths when enough are in view, otherwise by that step's own scene depth.
+PROFILES: dict[str, dict[str, float | bool | int]] = {
+    "pure": {"guided": True, "robust_anchors": True, "scale_window": 1, "scale_ratio": float("inf"), "robust_pose": True, "map_scale": True, "carry_scale": False},
+    "legacy": {"guided": False, "robust_anchors": False, "scale_window": 1, "scale_ratio": 4.0, "robust_pose": False, "map_scale": True},
+    "tuned": {"guided": True, "robust_anchors": True, "scale_window": 12, "scale_ratio": 1.1, "robust_pose": False, "map_scale": True},
+    "drone": {"guided": True, "robust_anchors": True, "scale_window": 12, "scale_ratio": 1.1, "robust_pose": True, "map_scale": False},
+}
+VIDEO_PROFILE: dict[str, str] = {
+    "drone-flying-industrial-cut.mp4": "drone",
+    "forest-walking.mp4": "legacy",
+}
+
+VIDEO_EXCLUDE_REGIONS: dict[str, list[tuple[float, float, float, float]]] = {
+    # the controller-cam overlay measures ~26% wide x ~35% tall
     "drone-flying-industrial.mp4": [(0.0, 0.64, 0.27, 1.0)],
     "drone-flying-industrial-cut.mp4": [(0.0, 0.64, 0.27, 1.0)],
 }
+# repair_motion: redo a pose when the rotation-free flow exceeds REPAIR_RATIO * raw flow + REPAIR_MIN_PX
+REPAIR_RATIO = 2.0
+REPAIR_MIN_PX = 4.0
+ROTATION_RANSAC_ITERS = 150
+SIGN_CONFIDENT_FRONT = 0.8  # share of points in front of both cameras that settles the sign of t
+SIGN_TIE_MARGIN = 0.3  # +t and -t this close count as a tie
+DEFAULT_MAP_CACHE = Path(__file__).resolve().parent / ".map-cache"
+DEFAULT_EXPORT_DIR = Path(__file__).resolve().parent / "exports"
 
 LK_PARAMS = dict(
     winSize=(21, 21),
@@ -160,46 +201,6 @@ def transport_hit(
     return None
 
 
-def exclude_boxes_for_video(video_path: Path) -> list[tuple[float, float, float, float]]:
-    return list(VIDEO_EXCLUDE_BOXES.get(video_path.name, ()))
-
-
-def exclude_mask_for_boxes(
-    width: int, height: int, boxes: list[tuple[float, float, float, float]]
-) -> np.ndarray | None:
-    """Feature-detection mask: 255 = allowed, 0 = excluded."""
-    if not boxes:
-        return None
-    mask = np.full((height, width), 255, np.uint8)
-    for x0, y0, x1, y1 in boxes:
-        xa, xb = int(np.floor(x0 * width)), int(np.ceil(x1 * width))
-        ya, yb = int(np.floor(y0 * height)), int(np.ceil(y1 * height))
-        mask[ya:yb, xa:xb] = 0
-    return mask
-
-
-def points_outside_exclude(
-    points: np.ndarray,
-    boxes: list[tuple[float, float, float, float]],
-    width: int,
-    height: int,
-) -> np.ndarray:
-    """True where a point lies outside every exclude box."""
-    if not boxes or len(points) == 0:
-        return np.ones(len(points.reshape(-1, 2)), dtype=bool)
-    flat = points.reshape(-1, 2)
-    ok = np.ones(len(flat), dtype=bool)
-    for x0, y0, x1, y1 in boxes:
-        inside = (
-            (flat[:, 0] >= x0 * width)
-            & (flat[:, 0] < x1 * width)
-            & (flat[:, 1] >= y0 * height)
-            & (flat[:, 1] < y1 * height)
-        )
-        ok &= ~inside
-    return ok
-
-
 def camera_matrix(width: int, height: int, fov_deg: float | None = None) -> np.ndarray:
     if fov_deg is None:
         focal = 0.9 * width
@@ -309,9 +310,7 @@ def detect_balanced(
     )
 
     counts = np.zeros((rows, cols), dtype=np.int32)
-    free = np.full((height, width), 255, np.uint8)
-    if exclude_mask is not None:
-        free = cv2.bitwise_and(free, exclude_mask)
+    free = np.full((height, width), 255, np.uint8) if exclude_mask is None else exclude_mask.copy()
     if len(pts):
         cx = np.clip((pts[:, 0] * cols / width).astype(int), 0, cols - 1)
         cy = np.clip((pts[:, 1] * rows / height).astype(int), 0, rows - 1)
@@ -372,7 +371,7 @@ def track_features(
     gray: np.ndarray,
     points: np.ndarray,
     fb_max_px: float = 0.0,
-    exclude_boxes: list[tuple[float, float, float, float]] | None = None,
+    exclude_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """LK tracking; a point is kept while LK finds it and it stays in the frame.
 
@@ -391,8 +390,10 @@ def track_features(
         & (flat[:, 1] >= 0)
         & (flat[:, 1] < height - 1)
     )
-    if exclude_boxes:
-        keep &= points_outside_exclude(forward, exclude_boxes, width, height)
+    if exclude_mask is not None and keep.any():
+        xi = np.clip(np.round(flat[:, 0]).astype(int), 0, width - 1)
+        yi = np.clip(np.round(flat[:, 1]).astype(int), 0, height - 1)
+        keep &= exclude_mask[yi, xi] > 0
     if fb_max_px > 0 and keep.any():
         backward, status_b, _ = cv2.calcOpticalFlowPyrLK(
             gray, prev_gray, forward, None, **LK_PARAMS
@@ -435,6 +436,99 @@ def estimate_motion(
     return rotation, translation, inliers
 
 
+def _rays(points: np.ndarray, intrinsic: np.ndarray) -> np.ndarray:
+    homogeneous = np.column_stack([points, np.ones(len(points))]) @ np.linalg.inv(intrinsic).T
+    return homogeneous / np.linalg.norm(homogeneous, axis=1, keepdims=True)
+
+
+def _kabsch(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Rotation R minimising |target - R source| for matched unit vectors (rows)."""
+    u, _, vt = np.linalg.svd(source.T @ target)
+    sign = np.sign(np.linalg.det(vt.T @ u.T))
+    return vt.T @ np.diag([1.0, 1.0, sign]) @ u.T
+
+
+def _estimate_rotation(
+    previous: np.ndarray, current: np.ndarray, intrinsic: np.ndarray, rng: np.random.Generator
+) -> np.ndarray:
+    """Rotation-only RANSAC; the flow of one commit is small, so this stays near identity."""
+    rays_a, rays_b = _rays(previous, intrinsic), _rays(current, intrinsic)
+    best, best_count = None, -1
+    for _ in range(ROTATION_RANSAC_ITERS):
+        idx = rng.choice(len(rays_a), 3, replace=False)
+        rotation = _kabsch(rays_a[idx], rays_b[idx])
+        moved = (rotation @ rays_a.T).T @ intrinsic.T
+        moved = moved[:, :2] / np.maximum(moved[:, 2:3], 1e-9)
+        inliers = np.linalg.norm(moved - current, axis=1) < 2.0
+        if inliers.sum() > best_count:
+            best, best_count = inliers, int(inliers.sum())
+    return _kabsch(rays_a[best], rays_b[best])
+
+
+def _translation_given_rotation(
+    previous: np.ndarray, current: np.ndarray, intrinsic: np.ndarray, rotation: np.ndarray, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """With R known, each match gives one linear constraint n . t = 0 (n = (R x1) x x2)."""
+    rays_a, rays_b = _rays(previous, intrinsic), _rays(current, intrinsic)
+    normals = np.cross((rotation @ rays_a.T).T, rays_b)
+    focal = float(intrinsic[0, 0])
+    best, best_count = None, -1
+    for _ in range(ROTATION_RANSAC_ITERS):
+        idx = rng.choice(len(normals), 2, replace=False)
+        t = np.cross(normals[idx[0]], normals[idx[1]])
+        norm = np.linalg.norm(t)
+        if norm < 1e-9:
+            continue
+        inliers = np.abs(normals @ (t / norm)) * focal < 1.0
+        if inliers.sum() > best_count:
+            best, best_count = inliers, int(inliers.sum())
+    if best is None or best_count < 15:
+        return None
+    t = np.linalg.svd(normals[best])[2][-1]
+    # Cheirality: the sign of t is the one that puts most points in front of both cameras.
+    cloud = cv2.triangulatePoints(
+        intrinsic @ np.hstack([np.eye(3), np.zeros((3, 1))]),
+        intrinsic @ np.hstack([rotation, t.reshape(3, 1)]),
+        previous[best].T.astype(np.float64),
+        current[best].T.astype(np.float64),
+    )
+    points = (cloud[:3] / cloud[3]).T
+    front = ((points[:, 2] > 0) & ((points @ rotation.T + t)[:, 2] > 0)).mean()
+    if front < 0.5:
+        t = -t
+    return t.reshape(3, 1), best
+
+
+def repair_motion(
+    motion: tuple[np.ndarray, np.ndarray, np.ndarray],
+    previous: np.ndarray,
+    current: np.ndarray,
+    intrinsic: np.ndarray,
+    stats: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Reject essential-matrix poses whose rotation contradicts the measured flow.
+
+    One commit spans only ~10-40 px of flow, so a genuine rotation cannot be several
+    degrees. When the flow left over after removing the estimated rotation is much bigger
+    than the raw flow, the 5-point fit has traded translation against rotation. The fix is
+    to estimate rotation on its own (RANSAC, three DoF), then solve translation linearly.
+    """
+    rotation, _, inliers = motion
+    raw = float(np.median(np.linalg.norm(current[inliers] - previous[inliers], axis=1)))
+    left_over = translation_parallax(rotation, intrinsic, previous[inliers], current[inliers])
+    if left_over <= REPAIR_RATIO * raw + REPAIR_MIN_PX:
+        return motion
+    rng = np.random.default_rng(len(previous))
+    rotation = _estimate_rotation(previous, current, intrinsic, rng)
+    solved = _translation_given_rotation(previous, current, intrinsic, rotation, rng)
+    if solved is None:
+        stats["pose_rejected"] = stats.get("pose_rejected", 0) + 1
+        return None
+    translation, inliers = solved
+    stats["pose_repaired"] = stats.get("pose_repaired", 0) + 1
+    return rotation, translation, inliers
+
+
 def triangulation_scale(points_cam: np.ndarray) -> float:
     depths = points_cam[:, 2]
     positive = depths > 0.1
@@ -469,7 +563,11 @@ MIN_TRIANGULATION_DEG = 1.0  # ignore observations with less ray separation than
 MAX_RAY_GAP = 0.1  # reject if the two rays miss by more than this fraction of depth
 MAX_OBSERVATION_WEIGHT = 100.0
 MIN_SCALE_MATCHES = 12  # landmarks needed to anchor the step scale to the map
-ANCHOR_INTERVAL = 3  # look for / add anchors every Nth committed pose update
+ANCHOR_INTERVAL = 3  # add anchors / run the global (no-prior) match every Nth pose update
+STRONG_FIX_INLIERS = 60  # a fix this well supported is trusted even if it looks like a big jump
+STRONG_FIX_RATIO = 0.3  # ...provided this share of its matches agree
+TRIVIAL_FIX_STEPS = 0.25  # skip fixes smaller than this many typical steps (and TRIVIAL_FIX_DEG)
+TRIVIAL_FIX_DEG = 0.3
 PRUNE_INTERVAL_SECONDS = 4.0  # how often isolated landmarks are checked for
 MAX_NEW_ANCHORS = 300  # per anchor step
 MIN_ANCHOR_LANDMARK_WEIGHT = 2.0  # only well-triangulated landmarks seed anchors
@@ -535,20 +633,63 @@ def sample_colors(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
     return bgr[:, ::-1].astype(np.float64) / 255.0
 
 
+def build_exclude_mask(
+    shape: tuple[int, int],
+    regions: list[tuple[float, float, float, float]] | None,
+) -> np.ndarray | None:
+    """uint8 mask, 255 = usable and 0 = ignored, from fractional (x0, y0, x1, y1) boxes."""
+    if not regions:
+        return None
+    height, width = shape
+    mask = np.full((height, width), 255, np.uint8)
+    for x0, y0, x1, y1 in regions:
+        mask[int(round(y0 * height)) : int(round(y1 * height)), int(round(x0 * width)) : int(round(x1 * width))] = 0
+    return mask
+
+
+def resolve_exclusions(args: argparse.Namespace) -> None:
+    """Fill args.exclude_regions and the tracking profile for the chosen video."""
+    name = "legacy" if args.profile is None else args.profile
+    if args.profile is None and args.video is not None:
+        name = VIDEO_PROFILE.get(Path(args.video).name, "legacy")
+    profile = PROFILES[name]
+    args.profile_name = name
+    args.guided = bool(profile["guided"]) and not args.no_guided
+    args.robust_anchors = bool(profile["robust_anchors"])
+    args.scale_window = int(profile["scale_window"])
+    args.robust_pose = bool(profile["robust_pose"])
+    args.no_map_scale = args.no_map_scale or not bool(profile["map_scale"])
+    args.scale_ratio = float(profile["scale_ratio"])
+    args.carry_scale = bool(profile.get("carry_scale", True))
+    regions: list[tuple[float, float, float, float]] = []
+    if args.video is not None and not args.no_default_exclude:
+        regions.extend(VIDEO_EXCLUDE_REGIONS.get(Path(args.video).name, []))
+    regions.extend(args.exclude or [])
+    args.exclude_regions = regions
+
+
+def translation_parallax(
+    rotation: np.ndarray, intrinsic: np.ndarray, key_px: np.ndarray, current_px: np.ndarray
+) -> float:
+    """Median pixel motion left over once the pure-rotation part is removed.
+
+    Rotation alone moves points by H = K R K^-1 regardless of depth. What is left is
+    caused by translation; near zero means the camera only turned (or barely moved), so
+    the translation direction from the essential matrix is just noise.
+    """
+    homography = intrinsic @ rotation @ np.linalg.inv(intrinsic)
+    moved = np.column_stack([key_px, np.ones(len(key_px))]) @ homography.T
+    moved = moved[:, :2] / np.maximum(moved[:, 2:3], 1e-9)
+    return float(np.median(np.linalg.norm(moved - current_px, axis=1)))
+
+
 def draw_tracks(
-    image: np.ndarray,
-    points: np.ndarray,
-    exclude_boxes: list[tuple[float, float, float, float]] | None = None,
+    image: np.ndarray, points: np.ndarray, exclude_mask: np.ndarray | None = None
 ) -> np.ndarray:
     vis = image.copy()
-    if exclude_boxes:
-        height, width = vis.shape[:2]
-        for x0, y0, x1, y1 in exclude_boxes:
-            xa, xb = int(x0 * width), int(x1 * width)
-            ya, yb = int(y0 * height), int(y1 * height)
-            region = vis[ya:yb, xa:xb]
-            vis[ya:yb, xa:xb] = (region.astype(np.float32) * 0.35).astype(np.uint8)
-            cv2.rectangle(vis, (xa, ya), (max(xa, xb - 1), max(ya, yb - 1)), (90, 90, 98), 1)
+    if exclude_mask is not None:
+        ignored = exclude_mask == 0
+        vis[ignored] = (vis[ignored] * 0.35).astype(np.uint8)
     for x, y in points.reshape(-1, 2):
         cv2.circle(vis, (int(round(x)), int(round(y))), 2, (0, 255, 0), -1)
     return vis
@@ -566,6 +707,548 @@ def resize_frame(frame: np.ndarray, scale: float) -> np.ndarray:
     )
 
 
+class SlamSession:
+    """Headless SLAM: frames in, pose / map out. The interactive app and benchmark share this."""
+
+    def __init__(
+        self,
+        first_frame: np.ndarray,
+        args: argparse.Namespace,
+        *,
+        fps: float = 30.0,
+        intrinsic: np.ndarray | None = None,
+    ) -> None:
+        """`intrinsic` overrides the pinhole matrix derived from args.fov_deg (frames must then match it)."""
+        self.args = args
+        self.fps = float(fps) or 30.0
+        self.frame_number = 0  # 0 = first frame, +1 per process() call
+        self.key_frame_number = 0  # frame number of the current keyframe image
+        self.motion_sample: MotionSample | None = None  # latest camera-motion estimate and the points behind it
+        self.height, self.width = first_frame.shape[:2]
+        if intrinsic is None:
+            self.intrinsic = camera_matrix(self.width, self.height, args.fov_deg)
+        else:
+            self.intrinsic = np.asarray(intrinsic, dtype=np.float64)
+        self.exclude_mask = build_exclude_mask(
+            (self.height, self.width), getattr(args, "exclude_regions", None)
+        )
+
+        gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+        self.prev_gray = gray
+        self.track_points = detect_balanced(
+            gray, None, args.max_features, exclude_mask=self.exclude_mask
+        )
+        self.track_ids = np.arange(len(self.track_points), dtype=np.int64)
+        self.next_track_id = len(self.track_points)
+
+        self.world_rotation = np.eye(3, dtype=np.float64)
+        self.world_position = np.zeros(3, dtype=np.float64)
+        self.trajectory = [self.world_position.copy()]
+        self.last_step_length: float | None = None
+
+        self.key_ids = np.empty(0, dtype=np.int64)
+        self.key_pts = np.empty((0, 2), dtype=np.float64)
+        self.key_birth_px = np.empty((0, 2), dtype=np.float64)
+        self.key_birth_R = np.empty((0, 3, 3), dtype=np.float64)
+        self.key_birth_C = np.empty((0, 3), dtype=np.float64)
+        self.key_gray: np.ndarray | None = None
+        self.set_keyframe(self.track_points, self.track_ids, gray)
+
+        cache_dir = None if args.no_disk_cache else args.map_cache.expanduser().resolve()
+        self.map_store = MapStore(
+            cache_dir=cache_dir,
+            ram_archive_limit=args.ram_archive_limit,
+            max_live_points=args.max_live_points,
+        )
+        self.mesh_builder = None if args.no_mesh else MeshBuilder(self.map_store)
+        self.anchors = None if args.no_anchors else AnchorMap(max_anchors=args.max_anchors, robust=args.robust_anchors)
+        self.stats = {
+            "commits": 0, "fixes": 0, "fix_rejected": 0, "guided_tries": 0, "guided_fixes": 0, "associated": 0, "pruned": 0, "thinned": 0,
+            "redundant": 0, "churned": 0, "churns": 0, "mesh_tris": 0,
+        }
+        self.churn_state = {"commits": 0, "inliers": 0}
+        self.prune_state = {"last": 0.0, "saturate": 0.0}
+        self.saturation_map = None if args.no_saturation else SaturationMap()
+        self.cell_targets = np.full(
+            (TRACK_GRID_ROWS, TRACK_GRID_COLS),
+            float(per_cell_target(args.max_features)),
+        )
+        self.processed = 0
+        # one row per pose event: (kind, step, inliers, parallax_px, rot_free_px, turn_deg, length)
+        self.commit_log: list[tuple] = []
+        self._last_delta: np.ndarray | None = None
+        # Monocular scale has no absolute reference, so the step length is carried over as a speed
+        # (distance per frame): commits span a varying number of frames, a per-commit length would not.
+        self.last_frame_speed: float | None = None
+        self.recent_steps: deque[float] = deque(maxlen=args.scale_window)  # recent speeds (distance per frame)
+
+    def video_clock(self) -> float:
+        return self.processed * max(self.args.stride, 1) / max(self.fps, 1e-6)
+
+    def set_keyframe(self, points: np.ndarray, ids: np.ndarray, image: np.ndarray) -> None:
+        self.key_gray = image
+        self.key_frame_number = self.frame_number
+        order = np.argsort(ids)
+        new_ids = ids[order]
+        new_pts = points.reshape(-1, 2)[order].astype(np.float64)
+        count = len(new_ids)
+        birth_px = new_pts.copy()
+        birth_R = np.broadcast_to(self.world_rotation, (count, 3, 3)).copy()
+        birth_C = np.broadcast_to(self.world_position, (count, 3)).copy()
+        if len(self.key_ids) > 0 and count > 0:
+            old = np.minimum(np.searchsorted(self.key_ids, new_ids), len(self.key_ids) - 1)
+            known = self.key_ids[old] == new_ids
+            birth_px[known] = self.key_birth_px[old[known]]
+            birth_R[known] = self.key_birth_R[old[known]]
+            birth_C[known] = self.key_birth_C[old[known]]
+        self.key_ids, self.key_pts = new_ids, new_pts.astype(np.float32)
+        self.key_birth_px, self.key_birth_R, self.key_birth_C = birth_px, birth_R, birth_C
+
+    def _update_cell_targets(self, pixels: np.ndarray, settled: np.ndarray) -> None:
+        cx = np.clip((pixels[:, 0] * TRACK_GRID_COLS / self.width).astype(int), 0, TRACK_GRID_COLS - 1)
+        cy = np.clip((pixels[:, 1] * TRACK_GRID_ROWS / self.height).astype(int), 0, TRACK_GRID_ROWS - 1)
+        total = np.zeros((TRACK_GRID_ROWS, TRACK_GRID_COLS))
+        done = np.zeros_like(total)
+        np.add.at(total, (cy, cx), 1.0)
+        np.add.at(done, (cy, cx), settled.astype(float))
+        fraction = np.where(total >= MIN_CELL_OBSERVATIONS, done / np.maximum(total, 1.0), 0.0)
+        wanted = allocate_cell_targets(self.args.max_features, fraction)
+        self.cell_targets = 0.6 * self.cell_targets + 0.4 * wanted
+
+    def _apply_fix(self, fix: PoseFix, step: int) -> bool:
+        """Snap the pose to an anchor fix and spread the correction over the path since the last one.
+
+        Returns True when the fix agrees with (or replaces) the live pose, False if it was
+        rejected as implausible.
+        """
+        anchors = self.anchors
+        start = anchors.last_fix_step
+        correction = correction_between(
+            self.world_rotation, self.world_position, fix.rotation, fix.position
+        )
+        shift, turn = correction.magnitude
+        stats = self.stats
+        robust = self.args.robust_anchors
+        if robust and shift < TRIVIAL_FIX_STEPS * (self.last_step_length or 0.0) and turn < TRIVIAL_FIX_DEG:
+            return True  # live pose already agrees with the map; nothing to correct
+
+        path = np.asarray(self.trajectory[start:])
+        path_len = float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) if len(path) > 1 else 0.0
+        # A fix backed by many consistent inliers beats dead-reckoning outright: after a
+        # fast stretch the live pose can be arbitrarily far off, and no gate based on how
+        # far we *think* we travelled can tell. Weaker fixes still have to look plausible.
+        strong = robust and fix.inliers >= STRONG_FIX_INLIERS and fix.inliers >= STRONG_FIX_RATIO * fix.matches
+        plausible = strong or (
+            turn < 30.0 and shift < 0.6 * path_len + 5.0 * (self.last_step_length or 0.0)
+        )
+        if not plausible:
+            stats["fix_rejected"] += 1
+            return False
+
+        poses = np.asarray(self.trajectory)
+        fraction = np.clip((np.arange(len(poses)) - start) / max(step - start, 1), 0.0, 1.0)
+        moving = fraction > 0.0
+        poses[moving] = correction.apply(poses[moving], fraction[moving])
+        self.trajectory[:] = [row.copy() for row in poses]
+        self.map_store.warp(correction, start, step)
+        if self.mesh_builder is not None:
+            self.mesh_builder.version += 1
+        anchors.warp(correction, start, step)
+        anchors.last_fix_step = step
+        if self.saturation_map is not None:
+            self.saturation_map.mark_dirty()
+        self.world_rotation, self.world_position = fix.rotation, fix.position.copy()
+        self.key_ids = np.empty(0, dtype=np.int64)
+        stats["fixes"] += 1
+        return True
+
+    def _run_anchor_step(
+        self,
+        gray: np.ndarray,
+        track_ids_now: np.ndarray,
+        track_px: np.ndarray,
+        periodic: bool,
+    ) -> None:
+        anchors = self.anchors
+        if anchors is None:
+            return
+        keypoints, descriptors, response = anchors.detect(gray, self.exclude_mask)
+        if len(keypoints) == 0:
+            return
+        step = len(self.trajectory) - 1
+        stale = step - MIN_AGE_STEPS
+
+        # Tier 1: guided matching around where the live pose expects each anchor. Cheap and
+        # clean, so it runs on every pose update and pulls the pose onto the map quickly.
+        query, matched = np.empty(0, dtype=int), np.empty(0, dtype=int)
+        settled = False
+        if self.args.guided:
+            query, matched = anchors.match_guided(
+                keypoints, descriptors, self.world_rotation, self.world_position,
+                self.intrinsic, (self.height, self.width), GUIDED_RADIUS_FRACTION * self.width,
+            )
+            old = anchors.steps[matched] <= stale
+            if old.sum() >= GUIDED_MIN_MATCHES:
+                self.stats["guided_tries"] += 1
+                fix = anchors.localize(
+                    keypoints[query[old]], matched[old], self.intrinsic,
+                    min_matches=GUIDED_MIN_MATCHES, min_inliers=GUIDED_MIN_INLIERS,
+                )
+                if fix is not None:
+                    settled = self._apply_fix(fix, step)
+                    self.stats["guided_fixes"] += int(settled)
+
+        # Tier 2: match against every anchor (no pose prior) to recover from large drift.
+        # Runs when the guided tier found nothing, and cannot be fooled by a bad live pose.
+        if not settled and (periodic or not self.args.guided):
+            query, matched = anchors.match(descriptors, self.world_position)
+            if len(query):
+                old = anchors.steps[matched] <= stale
+                fix = anchors.localize(keypoints[query[old]], matched[old], self.intrinsic)
+                if fix is not None:
+                    self._apply_fix(fix, step)
+        if not periodic:
+            return
+
+        found, landmarks = self.map_store.lookup(track_ids_now)
+        if found.sum() < 20:
+            return
+        weights = self.map_store.lookup_weights(track_ids_now)[found]
+        landmarks = landmarks[weights >= MIN_ANCHOR_LANDMARK_WEIGHT]
+        pixels = track_px[found][weights >= MIN_ANCHOR_LANDMARK_WEIGHT]
+        camera = (landmarks - self.world_position) @ self.world_rotation
+        ahead = camera[:, 2] > 0.2
+        depth = keypoint_depths(keypoints, pixels[ahead], camera[ahead, 2], (self.height, self.width))
+        valid = np.isfinite(depth)
+        if not valid.any():
+            return
+
+        normalized = np.column_stack([keypoints, np.ones(len(keypoints))]) @ np.linalg.inv(self.intrinsic).T
+        points = (self.world_rotation @ (normalized * depth[:, None]).T).T + self.world_position
+        to_camera = self.world_position - points
+        to_camera /= np.maximum(np.linalg.norm(to_camera, axis=1, keepdims=True), 1e-9)
+
+        wanted = valid.copy()
+        if len(query):
+            gap = np.linalg.norm(points[query] - anchors.positions[matched], axis=1)
+            same = gap < SAME_POINT_TOL * np.nan_to_num(depth[query], nan=1e9)
+            cos_view = np.einsum("ij,ij->i", to_camera[query], anchors.views[matched])
+            fresh_view = cos_view < np.cos(np.radians(NEW_VIEW_DEG))
+            wanted[query] = valid[query] & same & fresh_view
+        candidates = np.flatnonzero(wanted)
+        if len(candidates) > MAX_NEW_ANCHORS:
+            candidates = candidates[np.argsort(-response[candidates])[:MAX_NEW_ANCHORS]]
+        anchors.add(descriptors[candidates], points[candidates], to_camera[candidates], step)
+
+    def process(self, frame: np.ndarray) -> None:
+        """Advance tracking, pose and map by one BGR frame."""
+        args = self.args
+        self.frame_number += 1
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if len(self.track_points) < 8:
+            self.track_points = detect_balanced(
+                gray, None, args.max_features, exclude_mask=self.exclude_mask
+            )
+            self.track_ids = np.arange(
+                self.next_track_id, self.next_track_id + len(self.track_points), dtype=np.int64
+            )
+            self.next_track_id += len(self.track_points)
+            self.set_keyframe(self.track_points, self.track_ids, gray)
+            self.prev_gray = gray
+            self.processed += 1
+            return
+
+        next_points, keep = track_features(
+            self.prev_gray, gray, self.track_points, args.fb_check, self.exclude_mask
+        )
+        good_current = next_points[keep]
+        good_ids = self.track_ids[keep]
+
+        rekey = False
+        committed = False
+        pos = np.minimum(np.searchsorted(self.key_ids, good_ids), len(self.key_ids) - 1)
+        matched = self.key_ids[pos] == good_ids
+        if matched.sum() < KEYFRAME_MIN_MATCHES:
+            rekey = True
+        else:
+            key_matched = self.key_pts[pos[matched]]
+            current_matched = good_current[matched].reshape(-1, 2)
+            ids_matched = good_ids[matched]
+            parallax = float(np.median(np.linalg.norm(current_matched - key_matched, axis=1)))
+            if parallax >= KEYFRAME_MIN_PARALLAX_PX:
+                motion = estimate_motion(key_matched, current_matched, self.intrinsic)
+                if motion is not None and args.robust_pose:
+                    motion = repair_motion(motion, key_matched, current_matched, self.intrinsic, self.stats)
+                if motion is None:
+                    rekey = parallax > 4.0 * KEYFRAME_MIN_PARALLAX_PX
+                else:
+                    self.motion_sample = MotionSample(
+                        key_matched, current_matched, motion[0], motion[1], self.key_frame_number, self.frame_number
+                    )
+                    self._commit_pose(
+                        frame, gray, motion, key_matched, current_matched, ids_matched, pos[matched]
+                    )
+                    committed = True
+                    rekey = True
+
+        self.track_points = good_current.reshape(-1, 1, 2)
+        self.track_ids = good_ids
+        flat_tracks, self.track_ids = prune_crowded(
+            self.track_points, self.track_ids, self.width, self.height, args.max_features, self.cell_targets
+        )
+        self.track_points = flat_tracks.reshape(-1, 1, 2)
+
+        retired_px = None
+        if (
+            committed
+            and not args.no_churn
+            and self.churn_state["commits"] >= CHURN_EVERY_COMMITS
+            and self.churn_state["inliers"] >= CHURN_MIN_INLIERS
+        ):
+            weight_now = self.map_store.lookup_weights(self.track_ids)
+            mature = np.flatnonzero(weight_now >= CHURN_MIN_WEIGHT)
+            n_retire = min(len(mature), int(CHURN_FRACTION * len(self.track_ids)))
+            if n_retire >= 20:
+                retire = mature[np.argsort(self.track_ids[mature])[:n_retire]]
+                keep_track = np.ones(len(self.track_ids), dtype=bool)
+                keep_track[retire] = False
+                retired_px = self.track_points.reshape(-1, 2)[retire]
+                self.track_points, self.track_ids = self.track_points[keep_track], self.track_ids[keep_track]
+                self.stats["churned"] += n_retire
+                self.stats["churns"] += 1
+                self.churn_state["commits"] = 0
+        fresh = detect_balanced(
+            gray,
+            self.track_points,
+            args.max_features,
+            self.cell_targets,
+            avoid=retired_px,
+            refill_fraction=1.0 if retired_px is not None else TRACK_REFILL_FRACTION,
+            exclude_mask=self.exclude_mask,
+        )
+        if len(fresh):
+            fresh_ids = np.arange(self.next_track_id, self.next_track_id + len(fresh), dtype=np.int64)
+            self.next_track_id += len(fresh)
+            self.track_points = np.vstack([self.track_points, fresh])
+            self.track_ids = np.concatenate([self.track_ids, fresh_ids])
+
+        if rekey:
+            self.set_keyframe(self.track_points, self.track_ids, gray)
+        self.prev_gray = gray
+        self.processed += 1
+
+    def _log_commit(
+        self, kind: str, inliers: int, parallax: float, rot_free: float, delta: np.ndarray, rot_deg: float = 0.0
+    ) -> None:
+        length = float(np.linalg.norm(delta))
+        turn = 0.0
+        if self._last_delta is not None and length > 1e-12:
+            cos = float(delta @ self._last_delta) / (length * float(np.linalg.norm(self._last_delta)) + 1e-12)
+            turn = float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+        if length > 1e-12:
+            self._last_delta = delta.copy()
+        self.commit_log.append((kind, len(self.trajectory), inliers, parallax, rot_free, turn, length, rot_deg))
+
+    def _settle_direction(
+        self,
+        rotation: np.ndarray,
+        translation: np.ndarray,
+        unit_points: np.ndarray,
+        key_inlier: np.ndarray,
+        current_inlier: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Break translation-sign ties with the previous direction of travel.
+
+        When the matches barely constrain depth (near-pure rotation), +t and -t put about
+        as many points in front of the cameras, so the sign is a coin flip and the camera
+        appears to reverse. If the data cannot tell the signs apart, keep the old heading.
+        """
+        def in_front(points: np.ndarray, t: np.ndarray) -> float:
+            return float(((points[:, 2] > 0) & ((points @ rotation.T + t.reshape(3))[:, 2] > 0)).mean())
+
+        front = in_front(unit_points, translation)
+        if front >= SIGN_CONFIDENT_FRONT:
+            return translation, unit_points
+        flipped = -translation
+        flipped_points = triangulate_pair(self.intrinsic, rotation, flipped, key_inlier, current_inlier)
+        if front - in_front(flipped_points, flipped) > SIGN_TIE_MARGIN:
+            return translation, unit_points
+        heading = self.world_rotation @ (-(rotation.T @ translation.reshape(3)))
+        if float(heading @ self._last_delta) >= 0.0:
+            return translation, unit_points
+        self.stats["sign_flips"] = self.stats.get("sign_flips", 0) + 1
+        return flipped, flipped_points
+
+    def _commit_pose(
+        self,
+        frame: np.ndarray,
+        gray: np.ndarray,
+        motion: tuple[np.ndarray, np.ndarray, np.ndarray],
+        key_matched: np.ndarray,
+        current_matched: np.ndarray,
+        ids_matched: np.ndarray,
+        match_rows: np.ndarray,
+    ) -> None:
+        args = self.args
+        rotation, translation, inliers = motion
+        key_inlier = key_matched[inliers]
+        current_inlier = current_matched[inliers]
+        inlier_ids = ids_matched[inliers]
+        inlier_rows = match_rows[inliers]
+        good_ids = self.track_ids
+
+        unit_points = triangulate_pair(
+            self.intrinsic, rotation, translation, key_inlier, current_inlier
+        )
+        if args.robust_pose and self._last_delta is not None:
+            translation, unit_points = self._settle_direction(
+                rotation, translation, unit_points, key_inlier, current_inlier
+            )
+        scale = None
+        self.map_store.reactivate_in_view(
+            self.world_rotation, self.world_position, self.intrinsic, self.width, self.height
+        )
+        found, landmarks = self.map_store.lookup(inlier_ids)
+        if found.sum() >= MIN_SCALE_MATCHES and not args.no_map_scale:
+            depth_unit = unit_points[found, 2]
+            depth_map = ((landmarks - self.world_position) @ self.world_rotation)[:, 2]
+            usable = (depth_unit > 1e-3) & (depth_map > 1e-3)
+            if usable.sum() >= MIN_SCALE_MATCHES:
+                scale = float(np.median(depth_map[usable] / depth_unit[usable]))
+        frames_spanned = max(self.frame_number - self.key_frame_number, 1)
+        if scale is None:
+            scale = (
+                self.last_frame_speed * frames_spanned
+                if args.carry_scale and self.last_frame_speed is not None
+                else triangulation_scale(unit_points)
+            )
+        if self.recent_steps and np.isfinite(args.scale_ratio):
+            # Monocular scale has no absolute reference, so a few bad depth matches can make
+            # it jump or snowball. Keep it within a band around the recent median speed
+            # times the frames this commit spans.
+            reference = float(np.median(self.recent_steps)) * frames_spanned
+            scale = float(np.clip(scale, reference / args.scale_ratio, reference * args.scale_ratio))
+
+        camera_delta = -(rotation.T @ (translation.reshape(3) * scale))
+        world_delta = self.world_rotation @ camera_delta
+        self._log_commit(
+            "step", int(len(inlier_ids)), float(np.median(np.linalg.norm(current_inlier - key_inlier, axis=1))),
+            translation_parallax(rotation, self.intrinsic, key_inlier, current_inlier), world_delta,
+            float(np.degrees(np.arccos(np.clip((np.trace(rotation) - 1) / 2, -1, 1)))),
+        )
+        self.world_position = self.world_position + world_delta
+        self.world_rotation = self.world_rotation @ rotation.T
+        self.last_step_length = float(np.linalg.norm(camera_delta))
+        self.last_frame_speed = self.last_step_length / frames_spanned
+        self.recent_steps.append(self.last_frame_speed)
+        self.trajectory.append(self.world_position.copy())
+
+        rays_birth = pixel_rays(self.key_birth_px[inlier_rows], self.intrinsic, self.key_birth_R[inlier_rows])
+        rays_now = pixel_rays(current_inlier, self.intrinsic, self.world_rotation)
+        points_world, angle_deg, usable = triangulate_midpoint(
+            self.key_birth_C[inlier_rows],
+            rays_birth,
+            np.broadcast_to(self.world_position, (len(rays_now), 3)),
+            rays_now,
+        )
+        step = len(self.trajectory) - 1
+        if usable.any():
+            weights = np.clip(angle_deg[usable] ** 2, 0.01, MAX_OBSERVATION_WEIGHT)
+            colors = sample_colors(frame, current_inlier[usable])
+            obs_ids = inlier_ids[usable]
+            obs_points = points_world[usable]
+            obs_pixels = current_inlier[usable]
+            known, _ = self.map_store.lookup(obs_ids)
+            fresh = np.flatnonzero(~known)
+            if len(fresh):
+                hit, target = self.map_store.find_existing(
+                    obs_points[fresh],
+                    obs_pixels[fresh],
+                    self.world_rotation,
+                    self.world_position,
+                    self.intrinsic,
+                    self.width,
+                    self.height,
+                    exclude_ids=good_ids,
+                )
+                if hit.any():
+                    source = obs_ids[fresh][hit]
+                    obs_ids = remap_ids(obs_ids, source, target[hit])
+                    inlier_ids = remap_ids(inlier_ids, source, target[hit])
+                    self.stats["associated"] += int(hit.sum())
+            if self.saturation_map is not None and len(obs_points):
+                distance = np.linalg.norm(obs_points - self.world_position, axis=1)
+                settled = self.saturation_map.settled(self.map_store, obs_points, distance)
+                self._update_cell_targets(obs_pixels, settled)
+                known_now, _ = self.map_store.lookup(obs_ids)
+                redundant = settled & ~known_now
+                if redundant.any():
+                    self.stats["redundant"] += int(redundant.sum())
+                    fresh_only = ~redundant
+                    obs_points, colors = obs_points[fresh_only], colors[fresh_only]
+                    obs_ids, weights = obs_ids[fresh_only], weights[fresh_only]
+            self.map_store.add(obs_points, colors, obs_ids, weights, step, now=self.video_clock())
+
+        self.stats["commits"] += 1
+        self.churn_state["commits"] += 1
+        self.churn_state["inliers"] = len(inlier_ids)
+        if self.mesh_builder is not None:
+            found_m, pos_m, weight_m = self.map_store.lookup_all(inlier_ids)
+            if found_m.sum() >= 12:
+                self.stats["mesh_tris"] = self.mesh_builder.update(
+                    rotation=self.world_rotation,
+                    position=self.world_position,
+                    ids=inlier_ids[found_m],
+                    pixels=current_inlier[found_m],
+                    points=pos_m,
+                    weights=weight_m,
+                    gray=gray,
+                    key_gray=self.key_gray,
+                    key_ids=self.key_ids,
+                    key_pts=self.key_pts,
+                )
+            self.mesh_builder.purge(self.video_clock())
+        if self.anchors is not None:
+            periodic = self.stats["commits"] % ANCHOR_INTERVAL == 0
+            if periodic or args.guided:
+                self._run_anchor_step(gray, inlier_ids, current_inlier, periodic)
+
+        clock = self.video_clock()
+        if args.prune_age > 0 and clock - self.prune_state["last"] >= PRUNE_INTERVAL_SECONDS:
+            self.prune_state["last"] = clock
+            self.stats["pruned"] += self.map_store.prune_isolated(
+                clock,
+                np.asarray(self.trajectory),
+                args.prune_age,
+                args.prune_isolation,
+                check_window=2.0 * PRUNE_INTERVAL_SECONDS,
+                exempt_ids=None if self.saturation_map is None else self.saturation_map.anchor_ids,
+            )
+        if self.saturation_map is not None and clock - self.prune_state["saturate"] >= SATURATION_INTERVAL_SECONDS:
+            self.prune_state["saturate"] = clock
+            _, thinned = self.saturation_map.consolidate(self.map_store, clock, np.asarray(self.trajectory))
+            self.stats["thinned"] += thinned
+        self.map_store.archive_out_of_walker_view(
+            self.world_rotation, self.world_position, self.intrinsic, self.width, self.height
+        )
+
+    def finalize(self) -> None:
+        self.map_store.finalize()
+
+
+def remap_ids(ids: np.ndarray, source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    if len(source) == 0:
+        return ids
+    order = np.argsort(source)
+    source, target = source[order], target[order]
+    pos = np.minimum(np.searchsorted(source, ids), len(source) - 1)
+    hit = source[pos] == ids
+    out = ids.copy()
+    out[hit] = target[pos[hit]]
+    return out
+
+
 def layout_windows(video_width: int, video_height: int, map_height: int) -> None:
     margin_x = 40
     margin_y = 40
@@ -575,14 +1258,24 @@ def layout_windows(video_width: int, video_height: int, map_height: int) -> None
     cv2.moveWindow(TRACK_WINDOW, margin_x, margin_y + map_height + title_bar)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_box(text: str) -> tuple[float, float, float, float]:
+    try:
+        x0, y0, x1, y1 = (float(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected X0,Y0,X1,Y1 as fractions, e.g. 0,0.75,0.25,1") from None
+    if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+        raise argparse.ArgumentTypeError("box must satisfy 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1")
+    return x0, y0, x1, y1
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "video",
         nargs="?",
         type=Path,
         default=None,
-        help="path to input video; if omitted you pick one from video-samples/ by number",
+        help="path to input video (default: choose from 3D-SLAM/video-samples)",
     )
     parser.add_argument(
         "--scale",
@@ -703,48 +1396,125 @@ def parse_args() -> argparse.Namespace:
         "untracked regions",
     )
     parser.add_argument(
+        "--profile",
+        choices=sorted(PROFILES),
+        default=None,
+        help="tracking profile (default: per video, see VIDEO_PROFILE; unlisted videos use legacy)",
+    )
+    parser.add_argument(
+        "--no-map-scale",
+        action="store_true",
+        help="experimental: take each step's scale from the scene depth of that step alone "
+        "instead of from the map's landmark depths (avoids the map<->scale feedback loop)",
+    )
+    parser.add_argument(
+        "--no-guided",
+        action="store_true",
+        help="disable the pose-guided anchor matching tier (global matching only)",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        type=parse_box,
+        default=None,
+        metavar="X0,Y0,X1,Y1",
+        help="ignore this image box (fractions of the frame, origin top-left); repeatable. "
+        "Added to the per-video defaults in VIDEO_EXCLUDE_REGIONS",
+    )
+    parser.add_argument(
+        "--no-default-exclude",
+        action="store_true",
+        help="do not apply the built-in per-video exclusion boxes",
+    )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        metavar="NPZ",
+        help="pixel-ray camera calibration (.npz from virtual/calibrate_camera.py); "
+        "default: <video name>.calibration.npz next to the video, if it exists",
+    )
+    parser.add_argument(
+        "--no-deviation-window",
+        action="store_true",
+        help="do not open the window showing which screen sections disagree with the camera motion",
+    )
+    parser.add_argument(
+        "--no-calibration",
+        action="store_true",
+        help="ignore any camera calibration and assume an ideal pinhole from --fov-deg",
+    )
+    parser.add_argument(
         "--plot-every",
         type=int,
         default=3,
         help="refresh 3D map every N processed frames (default: 3)",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    resolve_exclusions(args)
+    return args
 
 
 def choose_video() -> Path:
-    """List the videos in video-samples/ and let the user pick one by number."""
-    samples = sorted(
-        p for p in DEFAULT_VIDEO.parent.glob("*") if p.suffix.lower() in VIDEO_SUFFIXES
+    """List the files in video-samples/ and ask which one to run."""
+    videos = sorted(
+        p
+        for p in SAMPLES_DIR.glob("*")
+        if p.suffix.lower() in VIDEO_SUFFIXES and p.is_file()
     )
-    if not samples:
-        raise SystemExit(f"No sample videos found in {DEFAULT_VIDEO.parent}")
-    default_index = samples.index(DEFAULT_VIDEO) + 1 if DEFAULT_VIDEO in samples else 1
+    if not videos:
+        raise SystemExit(f"No videos found in {SAMPLES_DIR}; pass a path instead.")
+    default_index = next(
+        (i for i, p in enumerate(videos) if p.resolve() == DEFAULT_VIDEO.resolve()), 0
+    )
     if not sys.stdin.isatty():
-        return samples[default_index - 1]
+        return videos[default_index]
 
-    print("Available videos:")
-    for number, path in enumerate(samples, start=1):
+    for i, path in enumerate(videos, start=1):
         size_mb = path.stat().st_size / 1e6
-        tag = "  (default)" if number == default_index else ""
-        print(f"  {number}) {path.name}  [{size_mb:.0f} MB]{tag}")
+        tag = "  (default)" if i - 1 == default_index else ""
+        print(f"  {i}) {path.name}  [{size_mb:.0f} MB]{tag}")
+    prompt = f"Choose a video [1-{len(videos)}, Enter={default_index + 1}, q=quit]: "
     while True:
         try:
-            answer = input(f"Choose a video [1-{len(samples)}, Enter={default_index}, q=quit]: ")
-        except (EOFError, KeyboardInterrupt):
-            raise SystemExit("\nNo video selected")
-        answer = answer.strip().lower()
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            return videos[default_index]
         if answer in ("q", "quit"):
-            raise SystemExit("No video selected")
+            raise SystemExit(0)
         if not answer:
-            return samples[default_index - 1]
-        if answer.isdigit() and 1 <= int(answer) <= len(samples):
-            return samples[int(answer) - 1]
-        print(f"  Please enter a number from 1 to {len(samples)}.")
+            return videos[default_index]
+        if answer.isdigit() and 1 <= int(answer) <= len(videos):
+            return videos[int(answer) - 1]
+        print("Invalid choice.")
+
+
+def load_undistorter(args: argparse.Namespace, video_path: Path, size: tuple[int, int]) -> Undistorter | None:
+    """Calibration for this camera, or None (no file, switched off, or it does not fit the frame size)."""
+    if args.no_calibration:
+        return None
+    path = args.calibration
+    if path is None:
+        path = video_path.with_name(f"{video_path.stem}.calibration.npz")
+        if not path.is_file():
+            return None
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise SystemExit(f"Calibration file not found: {path}")
+    try:
+        undistorter = Undistorter(load_rays(path), size)
+    except ValueError as error:
+        raise SystemExit(f"Cannot use calibration {path.name}: {error}")
+    print(f"Calibration: {path.name}, {undistorter.describe()}")
+    return undistorter
 
 
 def main() -> None:
     args = parse_args()
-    video_path = (args.video or choose_video()).expanduser().resolve()
+    if args.video is None:
+        args.video = choose_video()
+        resolve_exclusions(args)
+    video_path = args.video.expanduser().resolve()
     if not video_path.is_file():
         raise SystemExit(f"Video not found: {video_path}")
 
@@ -756,94 +1526,37 @@ def main() -> None:
     if not ok:
         raise SystemExit("Video has no readable frames")
 
-    if args.scale != 1.0:
-        frame = cv2.resize(
-            frame,
-            None,
-            fx=args.scale,
-            fy=args.scale,
-            interpolation=cv2.INTER_AREA,
-        )
+    frame = resize_frame(frame, args.scale)
+    undistorter = load_undistorter(args, video_path, (frame.shape[1], frame.shape[0]))
 
-    height, width = frame.shape[:2]
-    exclude_boxes = exclude_boxes_for_video(video_path)
-    exclude_mask = exclude_mask_for_boxes(width, height, exclude_boxes)
-    intrinsic = camera_matrix(width, height, args.fov_deg)
-    fx = intrinsic[0, 0]
-    print(f"Camera intrinsics: horizontal FOV {args.fov_deg:g}° -> fx={fx:.1f}px")
-    if exclude_boxes:
-        print(
-            f"SLAM ignores {len(exclude_boxes)} on-screen region(s) for {video_path.name} "
-            f"(see VIDEO_EXCLUDE_BOXES in 3d-slam.py)"
-        )
+    def prepare_frame(raw: np.ndarray) -> np.ndarray:
+        """Resize to the processing size, then correct the lens with the calibration if there is one."""
+        resized = resize_frame(raw, args.scale)
+        return resized if undistorter is None else undistorter.apply(resized)
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    prev_gray = gray
-    track_points = detect_balanced(
-        gray, None, args.max_features, exclude_mask=exclude_mask
+    frame = frame if undistorter is None else undistorter.apply(frame)
+    video_fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+    session = SlamSession(
+        frame, args, fps=video_fps, intrinsic=None if undistorter is None else undistorter.intrinsic
     )
-    track_ids = np.arange(len(track_points), dtype=np.int64)
-    next_track_id = len(track_points)
-
-    world_rotation = np.eye(3, dtype=np.float64)
-    world_position = np.zeros(3, dtype=np.float64)
-    trajectory = [world_position.copy()]
-    last_step_length: float | None = None
-
-    # Keyframe: the tracked points (sorted by id) at the last pose update, plus each
-    # track's *first* observation and the pose it was seen from, so depth can be
-    # triangulated over the longest baseline available.
-    key_ids = np.empty(0, dtype=np.int64)
-    key_pts = np.empty((0, 2), dtype=np.float64)
-    key_birth_px = np.empty((0, 2), dtype=np.float64)
-    key_birth_R = np.empty((0, 3, 3), dtype=np.float64)
-    key_birth_C = np.empty((0, 3), dtype=np.float64)
-    key_gray: np.ndarray | None = None
-
-    def set_keyframe(points: np.ndarray, ids: np.ndarray, image: np.ndarray) -> None:
-        nonlocal key_ids, key_pts, key_birth_px, key_birth_R, key_birth_C, key_gray
-        key_gray = image
-        order = np.argsort(ids)
-        new_ids = ids[order]
-        new_pts = points.reshape(-1, 2)[order].astype(np.float64)
-        count = len(new_ids)
-
-        birth_px = new_pts.copy()
-        birth_R = np.broadcast_to(world_rotation, (count, 3, 3)).copy()
-        birth_C = np.broadcast_to(world_position, (count, 3)).copy()
-        if len(key_ids) > 0 and count > 0:
-            old = np.minimum(np.searchsorted(key_ids, new_ids), len(key_ids) - 1)
-            known = key_ids[old] == new_ids
-            birth_px[known] = key_birth_px[old[known]]
-            birth_R[known] = key_birth_R[old[known]]
-            birth_C[known] = key_birth_C[old[known]]
-
-        key_ids, key_pts = new_ids, new_pts.astype(np.float32)
-        key_birth_px, key_birth_R, key_birth_C = birth_px, birth_R, birth_C
-
-    set_keyframe(track_points, track_ids, gray)
-
+    height, width = session.height, session.width
+    trajectory = session.trajectory
+    map_store = session.map_store
+    mesh_builder = session.mesh_builder
+    anchors = session.anchors
+    stats = session.stats
+    saturation_map = session.saturation_map
     cache_dir = None if args.no_disk_cache else args.map_cache.expanduser().resolve()
-    map_store = MapStore(
-        cache_dir=cache_dir,
-        ram_archive_limit=args.ram_archive_limit,
-        max_live_points=args.max_live_points,
+    fx = session.intrinsic[0, 0]
+    print(
+        f"Profile: {args.profile_name} (guided={args.guided}, robust anchors={args.robust_anchors}, "
+        f"scale window={args.scale_window}, ratio={args.scale_ratio:g}, robust pose={args.robust_pose}, map scale={not args.no_map_scale}); "
+        f"excluded regions: {len(args.exclude_regions)}"
     )
-
-    mesh_builder = None if args.no_mesh else MeshBuilder(map_store)
-    anchors = None if args.no_anchors else AnchorMap(max_anchors=args.max_anchors)
-    stats = {
-        "commits": 0, "fixes": 0, "associated": 0, "pruned": 0, "thinned": 0, "redundant": 0,
-        "churned": 0, "churns": 0, "mesh_tris": 0,
-    }
-    churn_state = {"commits": 0, "inliers": 0}
-
-    prune_state = {"last": 0.0, "saturate": 0.0}
-    saturation_map = None if args.no_saturation else SaturationMap()
-    cell_targets = np.full(
-        (TRACK_GRID_ROWS, TRACK_GRID_COLS),
-        float(per_cell_target(args.max_features)),
-    )
+    if undistorter is None:
+        print(f"Camera intrinsics: horizontal FOV {args.fov_deg:g}° -> fx={fx:.1f}px")
+    else:
+        print(f"Camera intrinsics: from calibration, fx={fx:.1f}px (--fov-deg not used)")
 
     map_height = max(320, height // 2)
     map_view = MapRenderer(width, map_height)
@@ -855,10 +1568,8 @@ def main() -> None:
     map_view.show(trajectory, map_store)
 
     frame_index = 0
-    processed = 0
     playback_mode = PlaybackMode.FORWARD
     last_vis: np.ndarray | None = None
-    video_fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
     play_delay_ms = max(1, int(round(1000.0 / video_fps)))
     button_regions: list[BarRegion] = []
     video_panel_height = height
@@ -870,7 +1581,7 @@ def main() -> None:
         mode_label = playback_mode.name.lower() if video_active else "map only"
         return [
             (
-                f"tracks: {len(track_points)}  poses: {len(trajectory)}  "
+                f"tracks: {len(session.track_points)}  poses: {len(trajectory)}  "
                 f"live: {map_store.live_count}  stored: {map_store.archive_count}  "
                 f"anchors: {len(anchors) if anchors is not None else 0}  "
                 f"fixes: {stats['fixes']}  pruned: {stats['pruned']}  "
@@ -885,7 +1596,7 @@ def main() -> None:
         ok, raw = capture.read()
         if not ok:
             return False, None
-        return True, resize_frame(raw, args.scale)
+        return True, prepare_frame(raw)
 
     def read_frame_backward() -> tuple[bool, np.ndarray | None]:
         pos = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
@@ -895,7 +1606,7 @@ def main() -> None:
         ok, raw = capture.read()
         if not ok:
             return False, None
-        return True, resize_frame(raw, args.scale)
+        return True, prepare_frame(raw)
 
     def stop_video_playback() -> None:
         nonlocal video_active, map_finalized, playback_mode
@@ -913,379 +1624,6 @@ def main() -> None:
             "Video stopped. Explore the 3D map "
             "(close the map window when finished)."
         )
-
-    def update_cell_targets(pixels: np.ndarray, settled: np.ndarray) -> None:
-        """Shift the tracking budget from image cells that show finished map to the rest."""
-        nonlocal cell_targets
-        cx = np.clip((pixels[:, 0] * TRACK_GRID_COLS / width).astype(int), 0, TRACK_GRID_COLS - 1)
-        cy = np.clip((pixels[:, 1] * TRACK_GRID_ROWS / height).astype(int), 0, TRACK_GRID_ROWS - 1)
-        total = np.zeros((TRACK_GRID_ROWS, TRACK_GRID_COLS))
-        done = np.zeros_like(total)
-        np.add.at(total, (cy, cx), 1.0)
-        np.add.at(done, (cy, cx), settled.astype(float))
-        fraction = np.where(total >= MIN_CELL_OBSERVATIONS, done / np.maximum(total, 1.0), 0.0)
-        wanted = allocate_cell_targets(args.max_features, fraction)
-        cell_targets = 0.6 * cell_targets + 0.4 * wanted
-
-    def video_clock() -> float:
-        """Seconds of video processed so far (the age of landmarks is measured in this)."""
-        return processed * max(args.stride, 1) / max(video_fps, 1e-6)
-
-    def remap_ids(ids: np.ndarray, source: np.ndarray, target: np.ndarray) -> np.ndarray:
-        if len(source) == 0:
-            return ids
-        order = np.argsort(source)
-        source, target = source[order], target[order]
-        pos = np.minimum(np.searchsorted(source, ids), len(source) - 1)
-        hit = source[pos] == ids
-        out = ids.copy()
-        out[hit] = target[pos[hit]]
-        return out
-
-    def run_anchor_step(gray: np.ndarray, track_ids_now: np.ndarray, track_px: np.ndarray) -> None:
-        """Relocalise against old anchors (closing loops), then add new anchors."""
-        nonlocal world_rotation, world_position, key_ids
-        keypoints, descriptors, response = anchors.detect(gray)
-        if exclude_boxes:
-            allowed = points_outside_exclude(keypoints, exclude_boxes, width, height)
-            keypoints, descriptors, response = (
-                keypoints[allowed],
-                descriptors[allowed],
-                response[allowed],
-            )
-        if len(keypoints) == 0:
-            return
-        step = len(trajectory) - 1
-        query, matched = anchors.match(descriptors, world_position)
-
-        if len(query):
-            old = anchors.steps[matched] <= step - MIN_AGE_STEPS
-            fix = anchors.localize(keypoints[query[old]], matched[old], intrinsic)
-            if fix is not None:
-                start = anchors.last_fix_step
-                correction = correction_between(
-                    world_rotation, world_position, fix.rotation, fix.position
-                )
-                shift, turn = correction.magnitude
-                path = np.asarray(trajectory[start:])
-                path_len = float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) if len(path) > 1 else 0.0
-                plausible = turn < 30.0 and shift < 0.6 * path_len + 5.0 * (last_step_length or 0.0)
-                if plausible:
-                    poses = np.asarray(trajectory)
-                    fraction = np.clip(
-                        (np.arange(len(poses)) - start) / max(step - start, 1), 0.0, 1.0
-                    )
-                    moving = fraction > 0.0
-                    poses[moving] = correction.apply(poses[moving], fraction[moving])
-                    trajectory[:] = [row.copy() for row in poses]
-                    map_store.warp(correction, start, step)
-                    if mesh_builder is not None:
-                        mesh_builder.version += 1  # corners moved: rebuild the view
-                    anchors.warp(correction, start, step)
-                    anchors.last_fix_step = step
-                    if saturation_map is not None:
-                        saturation_map.mark_dirty()
-                    world_rotation, world_position = fix.rotation, fix.position.copy()
-                    key_ids = np.empty(0, dtype=np.int64)  # births were in the old frame
-                    stats["fixes"] += 1
-                    print(
-                        f"[anchors] fix @ step {step}: {fix.inliers}/{fix.matches} inliers, "
-                        f"shift {shift:.3f} ({shift / max(path_len, 1e-9) * 100:.0f}% of path), "
-                        f"turn {turn:.2f}°"
-                    )
-
-        # New anchors: keypoints with a trustworthy depth from nearby tracked landmarks.
-        found, landmarks = map_store.lookup(track_ids_now)
-        if found.sum() < 20:
-            return
-        weights = map_store.lookup_weights(track_ids_now)[found]
-        landmarks = landmarks[weights >= MIN_ANCHOR_LANDMARK_WEIGHT]
-        pixels = track_px[found][weights >= MIN_ANCHOR_LANDMARK_WEIGHT]
-        camera = (landmarks - world_position) @ world_rotation
-        ahead = camera[:, 2] > 0.2
-        depth = keypoint_depths(keypoints, pixels[ahead], camera[ahead, 2], (height, width))
-        valid = np.isfinite(depth)
-        if not valid.any():
-            return
-
-        normalized = np.column_stack([keypoints, np.ones(len(keypoints))]) @ np.linalg.inv(intrinsic).T
-        points = (world_rotation @ (normalized * depth[:, None]).T).T + world_position
-        to_camera = world_position - points
-        to_camera /= np.maximum(np.linalg.norm(to_camera, axis=1, keepdims=True), 1e-9)
-
-        wanted = valid.copy()
-        if len(query):
-            gap = np.linalg.norm(points[query] - anchors.positions[matched], axis=1)
-            same = gap < SAME_POINT_TOL * np.nan_to_num(depth[query], nan=1e9)
-            cos_view = np.einsum("ij,ij->i", to_camera[query], anchors.views[matched])
-            fresh_view = cos_view < np.cos(np.radians(NEW_VIEW_DEG))
-            wanted[query] = valid[query] & same & fresh_view  # known point: only new views
-        candidates = np.flatnonzero(wanted)
-        if len(candidates) > MAX_NEW_ANCHORS:
-            candidates = candidates[np.argsort(-response[candidates])[:MAX_NEW_ANCHORS]]
-        anchors.add(descriptors[candidates], points[candidates], to_camera[candidates], step)
-
-    def process_slam_frame(frame: np.ndarray, gray: np.ndarray) -> np.ndarray:
-        nonlocal prev_gray, track_points, track_ids, next_track_id, processed
-        nonlocal world_rotation, world_position, trajectory, last_step_length
-
-        if len(track_points) < 8:
-            track_points = detect_balanced(
-                gray, None, args.max_features, exclude_mask=exclude_mask
-            )
-            track_ids = np.arange(
-                next_track_id, next_track_id + len(track_points), dtype=np.int64
-            )
-            next_track_id += len(track_points)
-            set_keyframe(track_points, track_ids, gray)
-            prev_gray = gray
-            processed += 1
-            if processed % args.plot_every == 0:
-                map_view.show(trajectory, map_store)
-            return draw_tracks(frame, track_points, exclude_boxes)
-
-        next_points, keep = track_features(
-            prev_gray, gray, track_points, args.fb_check, exclude_boxes
-        )
-        good_current = next_points[keep]
-        good_ids = track_ids[keep]
-
-        # Estimate motion against the keyframe (not the previous frame) so there is
-        # enough parallax; nothing is committed until the camera has actually moved.
-        rekey = False
-        committed = False
-        pos = np.minimum(np.searchsorted(key_ids, good_ids), len(key_ids) - 1)
-        matched = key_ids[pos] == good_ids
-        if matched.sum() < KEYFRAME_MIN_MATCHES:
-            rekey = True  # keyframe tracks lost: re-anchor, pose unchanged
-        else:
-            key_matched = key_pts[pos[matched]]
-            current_matched = good_current[matched].reshape(-1, 2)
-            ids_matched = good_ids[matched]
-            parallax = float(
-                np.median(np.linalg.norm(current_matched - key_matched, axis=1))
-            )
-            if parallax >= KEYFRAME_MIN_PARALLAX_PX:
-                motion = estimate_motion(key_matched, current_matched, intrinsic)
-                if motion is None:
-                    rekey = parallax > 4.0 * KEYFRAME_MIN_PARALLAX_PX
-                else:
-                    rotation, translation, inliers = motion
-                    if exclude_boxes:
-                        inliers &= points_outside_exclude(
-                            current_matched, exclude_boxes, width, height
-                        )
-                    if inliers.sum() < 8:
-                        rekey = parallax > 4.0 * KEYFRAME_MIN_PARALLAX_PX
-                    else:
-                        key_inlier = key_matched[inliers]
-                        current_inlier = current_matched[inliers]
-                        inlier_ids = ids_matched[inliers]
-                        inlier_rows = pos[matched][inliers]
-
-                        # Step length: the essential matrix only gives direction, so anchor
-                        # the scale to landmarks already in the map. This keeps the scale
-                        # consistent from step to step instead of resetting it every time.
-                        unit_points = triangulate_pair(
-                            intrinsic, rotation, translation, key_inlier, current_inlier
-                        )
-                        scale = None
-                        map_store.reactivate_in_view(
-                            world_rotation, world_position, intrinsic, width, height
-                        )
-                        found, landmarks = map_store.lookup(inlier_ids)
-                        if found.sum() >= MIN_SCALE_MATCHES:
-                            depth_unit = unit_points[found, 2]
-                            depth_map = ((landmarks - world_position) @ world_rotation)[:, 2]
-                            usable = (depth_unit > 1e-3) & (depth_map > 1e-3)
-                            if usable.sum() >= MIN_SCALE_MATCHES:
-                                scale = float(np.median(depth_map[usable] / depth_unit[usable]))
-                        if scale is None:
-                            scale = (
-                                last_step_length
-                                if last_step_length is not None
-                                else triangulation_scale(unit_points)
-                            )
-                        if last_step_length is not None:
-                            scale = float(
-                                np.clip(scale, last_step_length / 4.0, last_step_length * 4.0)
-                            )
-    
-                        camera_delta = -(rotation.T @ (translation.reshape(3) * scale))
-                        world_position = world_position + world_rotation @ camera_delta
-                        world_rotation = world_rotation @ rotation.T
-                        last_step_length = float(np.linalg.norm(camera_delta))
-                        trajectory.append(world_position.copy())
-    
-                        # Triangulate from each track's first sighting to now: the baseline
-                        # keeps growing as the camera moves, so distant and straight-ahead
-                        # points sharpen over time instead of staying noisy.
-                        rays_birth = pixel_rays(
-                            key_birth_px[inlier_rows], intrinsic, key_birth_R[inlier_rows]
-                        )
-                        rays_now = pixel_rays(current_inlier, intrinsic, world_rotation)
-                        points_world, angle_deg, usable = triangulate_midpoint(
-                            key_birth_C[inlier_rows],
-                            rays_birth,
-                            np.broadcast_to(world_position, (len(rays_now), 3)),
-                            rays_now,
-                        )
-                        step = len(trajectory) - 1
-                        if usable.any():
-                            weights = np.clip(angle_deg[usable] ** 2, 0.01, MAX_OBSERVATION_WEIGHT)
-                            colors = sample_colors(frame, current_inlier[usable])
-                            obs_ids = inlier_ids[usable]
-                            obs_points = points_world[usable]
-                            obs_pixels = current_inlier[usable]
-    
-                            # Tracks that are new but sit on a landmark we already have
-                            # (e.g. returning to an area) adopt that landmark's id, so
-                            # their observations refine it rather than duplicating it.
-                            known, _ = map_store.lookup(obs_ids)
-                            fresh = np.flatnonzero(~known)
-                            if len(fresh):
-                                hit, target = map_store.find_existing(
-                                    obs_points[fresh],
-                                    obs_pixels[fresh],
-                                    world_rotation,
-                                    world_position,
-                                    intrinsic,
-                                    width,
-                                    height,
-                                    exclude_ids=good_ids,
-                                )
-                                if hit.any():
-                                    source = obs_ids[fresh][hit]
-                                    obs_ids = remap_ids(obs_ids, source, target[hit])
-                                    inlier_ids = remap_ids(inlier_ids, source, target[hit])
-                                    good_ids = remap_ids(good_ids, source, target[hit])
-                                    stats["associated"] += int(hit.sum())
-                            if saturation_map is not None and len(obs_points):
-                                distance = np.linalg.norm(obs_points - world_position, axis=1)
-                                settled = saturation_map.settled(map_store, obs_points, distance)
-                                update_cell_targets(obs_pixels, settled)
-                                known_now, _ = map_store.lookup(obs_ids)
-                                redundant = settled & ~known_now  # complete region: nothing new to add
-                                if redundant.any():
-                                    stats["redundant"] += int(redundant.sum())
-                                    fresh_only = ~redundant
-                                    obs_points, colors = obs_points[fresh_only], colors[fresh_only]
-                                    obs_ids, weights = obs_ids[fresh_only], weights[fresh_only]
-                            map_store.add(obs_points, colors, obs_ids, weights, step, now=video_clock())
-    
-                        stats["commits"] += 1
-                        churn_state["commits"] += 1
-                        churn_state["inliers"] = len(inlier_ids)
-                        committed = True
-                        if mesh_builder is not None:
-                            found_m, pos_m, weight_m = map_store.lookup_all(inlier_ids)
-                            if found_m.sum() >= 12:
-                                stats["mesh_tris"] = mesh_builder.update(
-                                    rotation=world_rotation,
-                                    position=world_position,
-                                    ids=inlier_ids[found_m],
-                                    pixels=current_inlier[found_m],
-                                    points=pos_m,
-                                    weights=weight_m,
-                                    gray=gray,
-                                    key_gray=key_gray,
-                                    key_ids=key_ids,
-                                    key_pts=key_pts,
-                                )
-                            mesh_builder.purge(video_clock())
-                        if anchors is not None and stats["commits"] % ANCHOR_INTERVAL == 0:
-                            run_anchor_step(gray, inlier_ids, current_inlier)
-    
-                        clock = video_clock()
-                        if args.prune_age > 0 and clock - prune_state["last"] >= PRUNE_INTERVAL_SECONDS:
-                            prune_state["last"] = clock
-                            stats["pruned"] += map_store.prune_isolated(
-                                clock,
-                                np.asarray(trajectory),
-                                args.prune_age,
-                                args.prune_isolation,
-                                check_window=2.0 * PRUNE_INTERVAL_SECONDS,
-                                exempt_ids=None if saturation_map is None else saturation_map.anchor_ids,
-                            )
-                        if (
-                            saturation_map is not None
-                            and clock - prune_state["saturate"] >= SATURATION_INTERVAL_SECONDS
-                        ):
-                            prune_state["saturate"] = clock
-                            _, thinned = saturation_map.consolidate(
-                                map_store, clock, np.asarray(trajectory)
-                            )
-                            stats["thinned"] += thinned
-    
-                        map_store.archive_out_of_walker_view(
-                            world_rotation,
-                            world_position,
-                            intrinsic,
-                            width,
-                            height,
-                        )
-                        rekey = True
-
-        track_points = good_current.reshape(-1, 1, 2)
-        track_ids = good_ids
-
-        # Thin out crowded cells, then refill every sparse cell (including newly
-        # revealed edges) so the whole image stays tracked in either direction.
-        flat_tracks, track_ids = prune_crowded(
-            track_points, track_ids, width, height, args.max_features, cell_targets
-        )
-        track_points = flat_tracks.reshape(-1, 1, 2)
-
-        # Churn: with the pose firmly held, retire the oldest mature tracks and re-seed
-        # elsewhere (keeping clear of where they were) so new ground gets covered.
-        retired_px = None
-        if (
-            committed
-            and not args.no_churn
-            and churn_state["commits"] >= CHURN_EVERY_COMMITS
-            and churn_state["inliers"] >= CHURN_MIN_INLIERS
-        ):
-            weight_now = map_store.lookup_weights(track_ids)
-            mature = np.flatnonzero(weight_now >= CHURN_MIN_WEIGHT)
-            n_retire = min(len(mature), int(CHURN_FRACTION * len(track_ids)))
-            if n_retire >= 20:
-                retire = mature[np.argsort(track_ids[mature])[:n_retire]]
-                keep_track = np.ones(len(track_ids), dtype=bool)
-                keep_track[retire] = False
-                retired_px = track_points.reshape(-1, 2)[retire]
-                track_points, track_ids = track_points[keep_track], track_ids[keep_track]
-                stats["churned"] += n_retire
-                stats["churns"] += 1
-                churn_state["commits"] = 0
-        fresh = detect_balanced(
-            gray,
-            track_points,
-            args.max_features,
-            cell_targets,
-            avoid=retired_px,
-            refill_fraction=1.0 if retired_px is not None else TRACK_REFILL_FRACTION,
-            exclude_mask=exclude_mask,
-        )
-        if len(fresh):
-            fresh_ids = np.arange(
-                next_track_id, next_track_id + len(fresh), dtype=np.int64
-            )
-            next_track_id += len(fresh)
-            track_points = np.vstack([track_points, fresh])
-            track_ids = np.concatenate([track_ids, fresh_ids])
-
-        if exclude_boxes and len(track_points):
-            allowed = points_outside_exclude(track_points, exclude_boxes, width, height)
-            track_points, track_ids = track_points[allowed], track_ids[allowed]
-
-        if rekey:
-            set_keyframe(track_points, track_ids, gray)
-
-        prev_gray = gray
-        processed += 1
-        if processed % args.plot_every == 0:
-            map_view.show(trajectory, map_store)
-        return draw_tracks(frame, track_points, exclude_boxes)
 
     def show_vis(vis: np.ndarray) -> None:
         nonlocal last_vis, button_regions, video_panel_height
@@ -1326,11 +1664,27 @@ def main() -> None:
         write_stl(base.with_suffix(".stl"), vertices, faces)
         print(f"[mesh] exported {len(faces)} faces / {len(vertices)} vertices to {base}.ply / .stl")
 
+    deviation_meter = (
+        None
+        if args.no_deviation_window
+        else DeviationMeter((width, height), session.intrinsic, "vs the SLAM's estimated motion")
+    )
+    last_sample: MotionSample | None = None
+
     def handle_frame(frame: np.ndarray) -> None:
-        nonlocal frame_index
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        nonlocal frame_index, last_sample
         frame_index = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
-        show_vis(process_slam_frame(frame, gray))
+        session.process(frame)
+        map_view.camera_rotation = session.world_rotation
+        if session.processed % args.plot_every == 0:
+            map_view.show(trajectory, map_store)
+        show_vis(draw_tracks(frame, session.track_points, session.exclude_mask))
+        if deviation_meter is not None:
+            sample = session.motion_sample
+            if sample is not None and sample is not last_sample:
+                last_sample = sample
+                deviation_meter.add(sample)
+            cv2.imshow(DEVIATION_WINDOW, deviation_meter.render(frame, DEVIATION_WIDTH))
 
     print(f"Running SLAM on {video_path}")
     if args.max_seconds > 0:
@@ -1349,7 +1703,7 @@ def main() -> None:
     )
 
     cv2.setMouseCallback(TRACK_WINDOW, on_track_mouse)
-    show_vis(draw_tracks(frame, track_points, exclude_boxes))
+    show_vis(draw_tracks(frame, session.track_points, session.exclude_mask))
 
     try:
         while True:

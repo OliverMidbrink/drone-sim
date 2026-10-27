@@ -37,6 +37,10 @@ PROJECTION_FOV_Y_DEG = 45.0
 MARKER_DIAMETER_PX = 16  # camera sphere size on screen (logical pixels)
 MARKER_COLOR = (1.0, 0.25, 0.2)
 
+AXIS_LENGTH_PX = 60  # camera axis arrows, on-screen length (logical pixels)
+AXIS_HEAD_FRACTION = 0.22  # arrowhead length / arrow length
+AXIS_COLORS = ((1.0, 0.15, 0.15), (0.2, 1.0, 0.2), (0.3, 0.5, 1.0))  # camera x, y, z = red, green, blue
+
 DEFAULT_YAW = 0.85
 DEFAULT_PITCH = 0.38
 
@@ -215,6 +219,8 @@ class MapRenderer:
         self._last_cursor = (0.0, 0.0)
 
         self._trajectory: list[np.ndarray] = []
+        self.camera_rotation: np.ndarray | None = None  # camera -> world (3, 3); set by the SLAM script
+        self._axes_vbo: moderngl.Buffer | None = None
         self._map_store: MapStore | None = None
         self._render_points = np.empty((0, 3), dtype=np.float64)
         self._render_colors = np.empty((0, 3), dtype=np.float64)
@@ -572,6 +578,13 @@ class MapRenderer:
         self._user_camera = True
         self.draw()
 
+    @property
+    def context(self) -> moderngl.Context:
+        """The window's moderngl context (after setup_window), for rendering other things alongside the map."""
+        if self._ctx is None:
+            raise RuntimeError("call setup_window() first")
+        return self._ctx
+
     def poll(self) -> bool:
         if self._window is None:
             return False
@@ -664,6 +677,8 @@ class MapRenderer:
 
         if len(traj) > 0:
             self._draw_camera_marker(traj[-1], mvp)
+            if self.camera_rotation is not None:
+                self._draw_camera_axes(traj[-1], mvp, self.camera_rotation)
 
         self._draw_reset_button()
         self._draw_view_button()
@@ -732,6 +747,53 @@ class MapRenderer:
         )
         marker_vao.render(moderngl.POINTS, vertices=1)
         marker_vao.release()
+        self._ctx.enable(moderngl.DEPTH_TEST)
+
+    def _draw_camera_axes(self, position: np.ndarray, mvp: np.ndarray, rotation: np.ndarray) -> None:
+        """Camera x / y / z axes as red / green / blue arrows from the camera marker.
+
+        Camera axes are x right, y down, z forward (the SLAM convention); the columns of
+        `rotation` are those axes in world space. Constant on-screen length, drawn on top.
+        """
+        if self._ctx is None or self._program is None or self._window is None:
+            return
+
+        win_h = max(glfw.get_window_size(self._window)[1], 1)
+        fb_h = glfw.get_framebuffer_size(self._window)[1]
+        focal_px = fb_h / (2.0 * np.tan(np.radians(PROJECTION_FOV_Y_DEG) / 2.0))
+        depth = float((mvp @ np.append(position, 1.0))[3])
+        if depth <= 1e-4:
+            return  # camera is behind the viewer
+        length = AXIS_LENGTH_PX * fb_h / win_h * depth / focal_px
+        head = AXIS_HEAD_FRACTION * length
+
+        vertices: list[np.ndarray] = []
+        for axis in range(3):
+            direction = rotation[:, axis] * SLAM_TO_VIEW
+            direction = direction / np.linalg.norm(direction)
+            tip = position + direction * length
+            helper = np.array([0.0, 1.0, 0.0]) if abs(direction[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            side_a = np.cross(direction, helper)
+            side_a /= np.linalg.norm(side_a)
+            side_b = np.cross(direction, side_a)
+            barb_base = tip - direction * head
+            color = np.array(AXIS_COLORS[axis])
+            segments = [(position, tip)] + [(tip, barb_base + side * 0.4 * head) for side in (side_a, -side_a, side_b, -side_b)]
+            for start, end in segments:
+                vertices.append(np.concatenate([start, color]))
+                vertices.append(np.concatenate([end, color]))
+
+        data = np.array(vertices, dtype="f4")
+        if self._axes_vbo is None:
+            self._axes_vbo = self._ctx.buffer(reserve=data.nbytes)
+        self._axes_vbo.write(data.tobytes())
+
+        self._ctx.disable(moderngl.DEPTH_TEST)
+        self._ctx.line_width = 2.0
+        axes_vao = self._ctx.vertex_array(self._program, [(self._axes_vbo, "3f 3f", "in_position", "in_color")])
+        axes_vao.render(moderngl.LINES, vertices=len(vertices))
+        axes_vao.release()
+        self._ctx.line_width = 1.0
         self._ctx.enable(moderngl.DEPTH_TEST)
 
     def _draw_reset_button(self) -> None:
@@ -840,6 +902,8 @@ class MapRenderer:
             self._ui_vbo.release()
         if self._marker_vbo is not None:
             self._marker_vbo.release()
+        if self._axes_vbo is not None:
+            self._axes_vbo.release()
         if self._reset_texture is not None:
             self._reset_texture.release()
         for texture in self._view_textures.values():

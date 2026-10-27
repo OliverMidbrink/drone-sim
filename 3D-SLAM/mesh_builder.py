@@ -62,17 +62,23 @@ def _pixel_key(xy: np.ndarray) -> np.ndarray:
     return q[..., 0] * (1 << 20) + q[..., 1]
 
 
+_REMAP_CHUNK = 30000
+
+
 def _sample(image: np.ndarray, xy: np.ndarray) -> np.ndarray:
     """Bilinear grey values at float pixel positions of shape (..., 2)."""
     flat = np.ascontiguousarray(xy.reshape(-1, 2), dtype=np.float32)
-    out = cv2.remap(
-        image,
-        flat[:, 0].reshape(-1, 1),
-        flat[:, 1].reshape(-1, 1),
-        cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    return out.reshape(xy.shape[:-1]).astype(np.float32)
+    out = np.empty(len(flat), dtype=np.float32)
+    for start in range(0, len(flat), _REMAP_CHUNK):  # cv2.remap rejects maps with 32767+ rows
+        block = flat[start : start + _REMAP_CHUNK]
+        out[start : start + len(block)] = cv2.remap(
+            image,
+            block[:, 0].reshape(-1, 1),
+            block[:, 1].reshape(-1, 1),
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        ).reshape(-1)
+    return out.reshape(xy.shape[:-1])
 
 
 class MeshBuilder:

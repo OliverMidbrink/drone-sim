@@ -19,6 +19,8 @@ MIN_AGE_STEPS = 15  # anchors younger than this just echo dead-reckoning
 MIN_PNP_MATCHES = 30
 MIN_PNP_INLIERS = 30
 MIN_INLIER_SPREAD = 0.25  # inlier bounding box, as a fraction of the image
+LEGACY_RANSAC_ITERATIONS = 400
+RANSAC_ITERATIONS = 2000  # minimal 4-point (AP3P) samples are cheap, so spend many
 RANSAC_PX = 6.0  # anchor depths are approximate, so allow a loose first pass
 FINAL_PX = 4.0
 MAX_HAMMING = 64
@@ -26,6 +28,15 @@ MATCH_RATIO = 0.85
 SAME_POINT_TOL = 0.05  # anchors this close (fraction of depth) are the same point
 NEW_VIEW_DEG = 35.0  # a new view of a known point is stored past this angle
 MAX_VIEW_DEG = 60.0  # refine the pose with anchors seen from within this angle
+
+# Guided matching: predict where each anchor should appear under the current pose and
+# only compare descriptors inside a small window. Far fewer false matches than matching
+# against everything, so it can lock on with fewer inliers and run on every pose update.
+GUIDED_RADIUS_FRACTION = 0.07  # search window half-size, as a fraction of image width
+GUIDED_MIN_MATCHES = 20
+GUIDED_MIN_INLIERS = 20
+GUIDED_RATIO = 0.8
+GUIDED_MAX_CANDIDATES = 6000  # cap on anchors projected into the window test
 
 
 @dataclass
@@ -110,8 +121,12 @@ def keypoint_depths(
 
 
 class AnchorMap:
-    def __init__(self, max_anchors: int = 60_000, n_features: int = 1200) -> None:
+    def __init__(
+        self, max_anchors: int = 60_000, n_features: int = 1200, robust: bool = True
+    ) -> None:
         self.max_anchors = max_anchors
+        # robust: AP3P minimal solver with many RANSAC iterations; off = original EPnP x400
+        self.robust = robust
         self._orb = cv2.ORB_create(
             nfeatures=n_features,
             scaleFactor=1.2,
@@ -129,8 +144,10 @@ class AnchorMap:
     def __len__(self) -> int:
         return len(self.positions)
 
-    def detect(self, gray: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        keypoints, descriptors = self._orb.detectAndCompute(gray, None)
+    def detect(
+        self, gray: np.ndarray, mask: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        keypoints, descriptors = self._orb.detectAndCompute(gray, mask)
         if descriptors is None or len(keypoints) == 0:
             return (
                 np.empty((0, 2)),
@@ -166,13 +183,76 @@ class AnchorMap:
                 anchor.append(first.trainIdx)
         return np.array(query, dtype=int), np.array(anchor, dtype=int)
 
+    def match_guided(
+        self,
+        keypoints: np.ndarray,
+        descriptors: np.ndarray,
+        rotation: np.ndarray,
+        position: np.ndarray,
+        intrinsic: np.ndarray,
+        shape: tuple[int, int],
+        radius: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Query->anchor matches restricted to where the current pose predicts each anchor."""
+        empty = np.empty(0, dtype=int)
+        if len(self) < 2 or len(descriptors) == 0:
+            return empty, empty
+        height, width = shape
+        camera = (self.positions - position) @ rotation
+        depth = camera[:, 2]
+        safe = np.maximum(depth, 1e-6)
+        u = camera[:, 0] / safe * intrinsic[0, 0] + intrinsic[0, 2]
+        v = camera[:, 1] / safe * intrinsic[1, 1] + intrinsic[1, 2]
+        to_camera = position - self.positions
+        to_camera /= np.maximum(np.linalg.norm(to_camera, axis=1, keepdims=True), 1e-9)
+        visible = (
+            (depth > 0.2)
+            & (u > -radius) & (u < width + radius)
+            & (v > -radius) & (v < height + radius)
+            & (np.einsum("ij,ij->i", to_camera, self.views) > np.cos(np.radians(MAX_VIEW_DEG)))
+        )
+        candidates = np.flatnonzero(visible)
+        if len(candidates) < 2:
+            return empty, empty
+        if len(candidates) > GUIDED_MAX_CANDIDATES:
+            candidates = candidates[:: int(np.ceil(len(candidates) / GUIDED_MAX_CANDIDATES))]
+
+        near = (
+            (np.abs(keypoints[:, 0:1] - u[candidates][None, :].astype(np.float32)) < radius)
+            & (np.abs(keypoints[:, 1:2] - v[candidates][None, :].astype(np.float32)) < radius)
+        ).astype(np.uint8)
+        if not near.any():
+            return empty, empty
+        pairs = self._matcher.knnMatch(descriptors, self.descriptors[candidates], k=2, mask=near)
+        query, anchor = [], []
+        for pair in pairs:
+            if not pair:
+                continue
+            first = pair[0]
+            if first.distance > MAX_HAMMING:
+                continue
+            if len(pair) == 2:
+                second = pair[1]
+                if first.distance >= GUIDED_RATIO * second.distance:
+                    gap = np.linalg.norm(
+                        self.positions[candidates[first.trainIdx]] - self.positions[candidates[second.trainIdx]]
+                    )
+                    depth_here = np.linalg.norm(self.positions[candidates[first.trainIdx]] - position)
+                    if gap >= SAME_POINT_TOL * max(depth_here, 1e-6):
+                        continue
+            query.append(first.queryIdx)
+            anchor.append(int(candidates[first.trainIdx]))
+        return np.array(query, dtype=int), np.array(anchor, dtype=int)
+
     def localize(
         self,
         pixels: np.ndarray,
         anchor_idx: np.ndarray,
         intrinsic: np.ndarray,
+        min_matches: int = MIN_PNP_MATCHES,
+        min_inliers: int = MIN_PNP_INLIERS,
     ) -> PoseFix | None:
-        if len(anchor_idx) < MIN_PNP_MATCHES:
+        if len(anchor_idx) < min_matches:
             return None
         obj = self.positions[anchor_idx].reshape(-1, 1, 3)
         img = pixels.reshape(-1, 1, 2)
@@ -181,12 +261,12 @@ class AnchorMap:
             img,
             intrinsic,
             None,
-            iterationsCount=400,
+            iterationsCount=RANSAC_ITERATIONS if self.robust else LEGACY_RANSAC_ITERATIONS,
             reprojectionError=RANSAC_PX,
             confidence=0.999,
-            flags=cv2.SOLVEPNP_EPNP,
+            flags=cv2.SOLVEPNP_AP3P if self.robust else cv2.SOLVEPNP_EPNP,
         )
-        if not ok or inliers is None or len(inliers) < MIN_PNP_INLIERS:
+        if not ok or inliers is None or len(inliers) < min_inliers:
             return None
 
         def residuals(rv: np.ndarray, tv: np.ndarray) -> np.ndarray:
@@ -196,7 +276,7 @@ class AnchorMap:
         chosen = inliers.ravel()
         rvec, tvec = cv2.solvePnPRefineLM(obj[chosen], img[chosen], intrinsic, None, rvec, tvec)
         keep = residuals(rvec, tvec) < FINAL_PX
-        if keep.sum() < MIN_PNP_INLIERS:
+        if keep.sum() < min_inliers:
             return None
 
         # Anchors seen from near the current viewing direction localise best.
@@ -209,12 +289,12 @@ class AnchorMap:
             > np.cos(np.radians(MAX_VIEW_DEG))
         )
         best = keep & similar
-        if best.sum() >= MIN_PNP_INLIERS:
+        if best.sum() >= min_inliers:
             rvec, tvec = cv2.solvePnPRefineLM(
                 obj[best], img[best], intrinsic, None, rvec, tvec
             )
             keep = residuals(rvec, tvec) < FINAL_PX
-            if keep.sum() < MIN_PNP_INLIERS:
+            if keep.sum() < min_inliers:
                 return None
 
         inlier_px = pixels[keep]
