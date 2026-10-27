@@ -26,6 +26,7 @@ from anchor_map import (
 from camera_calibration import Undistorter, load_rays
 from map_renderer import MAP_WINDOW, MapRenderer
 from motion_deviation import DeviationMeter, MotionSample
+from raw_session import RawSession
 from map_store import MapStore
 from mesh_builder import MeshBuilder, write_ply, write_stl
 from saturation import SaturationMap
@@ -55,14 +56,19 @@ DEFAULT_VIDEO = SAMPLES_DIR / "forest-walking.mp4"
 # explored for it. "legacy" and "tuned" are never changed by that work.
 # "pure" has no clamping and no carried-over speed: each step is scaled by the map's landmark
 # depths when enough are in view, otherwise by that step's own scene depth.
+# "raw" does not use this pipeline at all: it runs raw_slam.RawSlam (live feature tracking plus
+# global ORB anchors, no speed limit, clamp, carried speed or scene-depth scale) through
+# raw_session.RawSession. Its other values are only there so the shared code has something to read.
 PROFILES: dict[str, dict[str, float | bool | int]] = {
     "pure": {"guided": True, "robust_anchors": True, "scale_window": 1, "scale_ratio": float("inf"), "robust_pose": True, "map_scale": True, "carry_scale": False},
     "legacy": {"guided": False, "robust_anchors": False, "scale_window": 1, "scale_ratio": 4.0, "robust_pose": False, "map_scale": True},
     "tuned": {"guided": True, "robust_anchors": True, "scale_window": 12, "scale_ratio": 1.1, "robust_pose": False, "map_scale": True},
     "drone": {"guided": True, "robust_anchors": True, "scale_window": 12, "scale_ratio": 1.1, "robust_pose": True, "map_scale": False},
 }
+PROFILES["raw"] = {**PROFILES["pure"], "engine": "raw"}
 VIDEO_PROFILE: dict[str, str] = {
-    "drone-flying-industrial-cut.mp4": "drone",
+    "drone-flying-industrial.mp4": "raw",
+    "drone-flying-industrial-cut.mp4": "raw",
     "forest-walking.mp4": "legacy",
 }
 
@@ -654,6 +660,7 @@ def resolve_exclusions(args: argparse.Namespace) -> None:
         name = VIDEO_PROFILE.get(Path(args.video).name, "legacy")
     profile = PROFILES[name]
     args.profile_name = name
+    args.engine = str(profile.get("engine", "classic"))
     args.guided = bool(profile["guided"]) and not args.no_guided
     args.robust_anchors = bool(profile["robust_anchors"])
     args.scale_window = int(profile["scale_window"])
@@ -1536,9 +1543,17 @@ def main() -> None:
 
     frame = frame if undistorter is None else undistorter.apply(frame)
     video_fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
-    session = SlamSession(
-        frame, args, fps=video_fps, intrinsic=None if undistorter is None else undistorter.intrinsic
-    )
+    session_intrinsic = None if undistorter is None else undistorter.intrinsic
+    if args.engine == "raw":
+        height_px, width_px = frame.shape[:2]
+        session = RawSession(
+            frame,
+            camera_matrix(width_px, height_px, args.fov_deg) if session_intrinsic is None else session_intrinsic,
+            build_exclude_mask((height_px, width_px), args.exclude_regions),
+            fps=video_fps,
+        )
+    else:
+        session = SlamSession(frame, args, fps=video_fps, intrinsic=session_intrinsic)
     height, width = session.height, session.width
     trajectory = session.trajectory
     map_store = session.map_store
@@ -1579,6 +1594,11 @@ def main() -> None:
     def hud_lines() -> list[str]:
         t_sec = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         mode_label = playback_mode.name.lower() if video_active else "map only"
+        if args.engine == "raw":
+            return [
+                f"raw SLAM  tracks: {len(session.track_points)}  poses: {len(trajectory)}  {session.describe()}",
+                f"time: {t_sec:.1f}s  frame: {int(capture.get(cv2.CAP_PROP_POS_FRAMES))}  ({mode_label})",
+            ]
         return [
             (
                 f"tracks: {len(session.track_points)}  poses: {len(trajectory)}  "
@@ -1666,7 +1686,7 @@ def main() -> None:
 
     deviation_meter = (
         None
-        if args.no_deviation_window
+        if args.no_deviation_window or args.engine == "raw"
         else DeviationMeter((width, height), session.intrinsic, "vs the SLAM's estimated motion")
     )
     last_sample: MotionSample | None = None

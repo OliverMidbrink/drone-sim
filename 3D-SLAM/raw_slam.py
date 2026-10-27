@@ -85,7 +85,9 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
 
 
 class RawSlam:
-    def __init__(self, first_frame: np.ndarray, intrinsic: np.ndarray) -> None:
+    def __init__(self, first_frame: np.ndarray, intrinsic: np.ndarray, exclude_mask: np.ndarray | None = None) -> None:
+        """`exclude_mask`: uint8 image, 0 where the frame must be ignored (overlays, the drone's own body)."""
+        self.exclude_mask = exclude_mask
         self.intrinsic = intrinsic
         self.intrinsic_inverse = np.linalg.inv(intrinsic)
         self.frame_number = 0
@@ -122,7 +124,7 @@ class RawSlam:
         wanted = MAX_FEATURES - len(self.track_points)
         if wanted <= 0:
             return
-        mask = np.full(gray.shape, 255, np.uint8)
+        mask = np.full(gray.shape, 255, np.uint8) if self.exclude_mask is None else self.exclude_mask.copy()
         for x, y in self.track_points:
             cv2.circle(mask, (int(x), int(y)), FEATURE_MIN_DISTANCE, 0, -1)
         found = cv2.goodFeaturesToTrack(gray, wanted, FEATURE_QUALITY, FEATURE_MIN_DISTANCE, mask=mask)
@@ -161,6 +163,10 @@ class RawSlam:
                 & (moved[:, 0] >= 0) & (moved[:, 0] < width - 1)
                 & (moved[:, 1] >= 0) & (moved[:, 1] < height - 1)
             )
+            if self.exclude_mask is not None and keep.any():
+                column = np.clip(np.round(moved[:, 0]).astype(int), 0, width - 1)
+                row = np.clip(np.round(moved[:, 1]).astype(int), 0, height - 1)
+                keep &= self.exclude_mask[row, column] > 0
             self.track_points, self.track_ids = moved[keep], self.track_ids[keep]
 
         changed, rekey = False, False
@@ -285,7 +291,7 @@ class RawSlam:
 
     # ------------------------------------------------------------------ anchors
     def _anchors_and_fix(self, gray: np.ndarray) -> None:
-        keypoints, descriptors = self.orb.detectAndCompute(gray, None)
+        keypoints, descriptors = self.orb.detectAndCompute(gray, self.exclude_mask)
         if descriptors is None or len(keypoints) == 0:
             return
         if self.commits % LOCALIZE_EVERY == 0:
