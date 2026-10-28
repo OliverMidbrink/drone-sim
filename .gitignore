@@ -9,3 +9,4 @@ __pycache__/
 exports/
 3D-SLAM/.phone-cert/
 *~
+virtual-sim/out/
