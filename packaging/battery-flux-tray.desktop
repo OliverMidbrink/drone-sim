@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Battery flux (tray)
+Comment=30s battery trend and ETA in the top bar
+Exec=python3 /home/oliverm/Life/FunProjects/drone-sim/battery-flux.py --tray
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
