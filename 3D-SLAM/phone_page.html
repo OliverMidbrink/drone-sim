@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Phone SLAM camera</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee; font: 15px -apple-system, system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  video { max-width: 100%; max-height: 100%; background: #000; }
+  #hud { position: fixed; left: 0; right: 0; top: 0; padding: env(safe-area-inset-top) 10px 6px; background: rgba(0,0,0,.55); font-size: 13px; white-space: pre-wrap; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); display: flex; gap: 10px; background: rgba(0,0,0,.55); }
+  button { flex: 1; font-size: 17px; padding: 12px; border-radius: 10px; border: 0; background: #2c7be5; color: #fff; }
+  button.secondary { background: #444; }
+  button:disabled { opacity: .4; }
+</style>
+</head>
+<body>
+<div id="stage"><video id="video" playsinline muted autoplay></video></div>
+<div id="hud">Tap Start to share the camera with the SLAM server.</div>
+<div id="bar">
+  <button id="start">Start</button>
+  <button id="reset" class="secondary" disabled>Reset map</button>
+</div>
+<canvas id="canvas" hidden></canvas>
+<script>
+const token = new URLSearchParams(location.search).get("token") || "";
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const startButton = document.getElementById("start");
+const resetButton = document.getElementById("reset");
+let socket = null, running = false, sent = 0, serverText = "", lastRateTime = performance.now(), rate = 0;
+
+function show(extra) {
+  hud.textContent = [extra, serverText].filter(Boolean).join("\n");
+}
+
+function nextVideoFrame() {
+  // wait for the camera to deliver a new picture (never send the same one twice)
+  if (video.requestVideoFrameCallback) return new Promise(r => video.requestVideoFrameCallback(() => r()));
+  return new Promise(r => requestAnimationFrame(() => r()));
+}
+
+async function sendFrame(config) {
+  if (!running || socket.readyState !== WebSocket.OPEN) return;
+  await nextVideoFrame();
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) { setTimeout(() => sendFrame(config), 50); return; }
+  const factor = config.size / Math.max(vw, vh);
+  canvas.width = Math.round(vw * factor);
+  canvas.height = Math.round(vh * factor);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  canvas.toBlob(async blob => {
+    if (!running || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(await blob.arrayBuffer());
+    sent += 1;
+  }, "image/jpeg", config.jpeg);
+}
+
+async function start() {
+  startButton.disabled = true;
+  try {
+    const config = await (await fetch("/config?token=" + encodeURIComponent(token))).json();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("No camera access: this page must be opened over https.");
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    try { if (navigator.wakeLock) await navigator.wakeLock.request("screen"); } catch (e) {}
+
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    socket = new WebSocket(`${scheme}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+    socket.onopen = () => { running = true; resetButton.disabled = false; startButton.textContent = "Stop"; startButton.disabled = false; show("Connected."); sendFrame(config); };
+    socket.onmessage = event => {
+      // every answer from the server means "ready for the next frame"
+      serverText = event.data;
+      const now = performance.now();
+      rate = 0.9 * rate + 0.1 * (1000 / Math.max(now - lastRateTime, 1));
+      lastRateTime = now;
+      show(`sent ${sent} frames, ${rate.toFixed(1)} fps, ${video.videoWidth}x${video.videoHeight} camera`);
+      sendFrame(config);
+    };
+    socket.onclose = () => { if (running) stop("Connection closed."); };
+    socket.onerror = () => show("Connection error.");
+  } catch (error) {
+    startButton.disabled = false;
+    show("Error: " + error.message);
+  }
+}
+
+function stop(message) {
+  running = false;
+  if (socket) socket.close();
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  video.srcObject = null;
+  resetButton.disabled = true;
+  startButton.textContent = "Start";
+  startButton.disabled = false;
+  show(message || "Stopped.");
+}
+
+startButton.onclick = () => (running ? stop() : start());
+resetButton.onclick = () => { if (socket && socket.readyState === WebSocket.OPEN) socket.send("reset"); };
+</script>
+</body>
+</html>

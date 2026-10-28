@@ -67,8 +67,7 @@ PROFILES: dict[str, dict[str, float | bool | int]] = {
 }
 PROFILES["raw"] = {**PROFILES["pure"], "engine": "raw"}
 VIDEO_PROFILE: dict[str, str] = {
-    "drone-flying-industrial.mp4": "raw",
-    "drone-flying-industrial-cut.mp4": "raw",
+    "drone-flying-industrial-cut.mp4": "drone",
     "forest-walking.mp4": "legacy",
 }
 
@@ -1715,7 +1714,7 @@ def main() -> None:
     )
     print(
         "Map window: LMB look around, MMB orbit, RMB pan, W/A/S/D fly, Space up, Ctrl down, "
-        "Shift = 3x speed, scroll forward/back, Reset button top-left"
+        "Q/E roll left/right, Shift = 3x speed, scroll forward/back, Reset button top-left"
     )
     print(
         f"Map: up to {args.max_features} tracks, live cap {args.max_live_points}, "

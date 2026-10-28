@@ -1,4 +1,4 @@
-"""GPU 3D map view (OpenGL via moderngl): orbit, pan, WASD fly, scroll forward/back."""
+"""GPU 3D map view (OpenGL via moderngl): orbit, pan, WASD fly, Q/E roll, scroll forward/back."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import numpy as np
 from map_store import MapStore
 
 MAP_WINDOW = (
-    "3D SLAM map (LMB look, MMB orbit, RMB pan, WASD fly, Space up, Ctrl down, Shift = 3x speed)"
+    "3D SLAM map (LMB look, MMB orbit, RMB pan, WASD fly, Space up, Ctrl down, Q/E roll, Shift = 3x speed)"
 )
 
 FLY_SPEED = 0.18  # WASD speed, in view-distances per second
@@ -43,6 +43,7 @@ AXIS_COLORS = ((1.0, 0.15, 0.15), (0.2, 1.0, 0.2), (0.3, 0.5, 1.0))  # camera x,
 
 DEFAULT_YAW = 0.85
 DEFAULT_PITCH = 0.38
+ROLL_SPEED = 1.2  # rad/s while Q / E is held
 
 _VERTEX_SHADER = """
 #version 330 core
@@ -206,6 +207,7 @@ class MapRenderer:
         self.logical_height = height
         self.yaw = DEFAULT_YAW
         self.pitch = DEFAULT_PITCH
+        self.roll = 0.0  # lean of the camera around its view direction, + = to the right
         self.distance = 4.0
         self.pan = np.zeros(3, dtype=np.float64)
         self.focus = np.zeros(3, dtype=np.float64)
@@ -459,6 +461,10 @@ class MapRenderer:
         else:
             right /= norm
         up = np.cross(right, forward)
+        if self.roll != 0.0:
+            # lean the camera around its view direction (E = to the right, Q = to the left)
+            cos, sin = np.cos(self.roll), np.sin(self.roll)
+            right, up = cos * right - sin * up, cos * up + sin * right
         return right, up
 
     def _in_reset_button(self, x: float, y: float) -> bool:
@@ -470,6 +476,7 @@ class MapRenderer:
     def reset_view(self) -> None:
         self.yaw = DEFAULT_YAW
         self.pitch = DEFAULT_PITCH
+        self.roll = 0.0
         self.pan[:] = 0.0
         self._user_camera = False
         self._follow_released = False
@@ -545,7 +552,7 @@ class MapRenderer:
         return glfw.get_key(self._window, key) == glfw.PRESS
 
     def _apply_keyboard_motion(self) -> None:
-        """WASD = fly, Space = up, Ctrl = down, Shift = 3x speed (while the map window has focus)."""
+        """WASD = fly, Space = up, Ctrl = down, Shift = 3x speed, Q / E = roll left / right (while the map window has focus)."""
         now = time.monotonic()
         dt = min(now - self._last_motion_time, 0.1)
         self._last_motion_time = now
@@ -568,8 +575,15 @@ class MapRenderer:
         if self._key_down(glfw.KEY_LEFT_CONTROL) or self._key_down(glfw.KEY_RIGHT_CONTROL):
             move -= world_up
 
+        lean = float(self._key_down(glfw.KEY_E)) - float(self._key_down(glfw.KEY_Q))
+        if lean != 0.0:
+            self.roll += lean * ROLL_SPEED * dt
+            self._user_camera = True
+
         length = float(np.linalg.norm(move))
         if length < 1e-9:
+            if lean != 0.0:
+                self.draw()
             return
         speed = max(self.distance, 0.5) * FLY_SPEED
         if self._key_down(glfw.KEY_LEFT_SHIFT) or self._key_down(glfw.KEY_RIGHT_SHIFT):
@@ -631,7 +645,7 @@ class MapRenderer:
         self._update_focus_and_distance(traj, self._render_points)
         self._upload_geometry(traj, self._render_points, self._render_colors)
 
-        view = _look_at(eye, target, np.array([0.0, 1.0, 0.0]))
+        view = _look_at(eye, target, self._camera_right_up()[1])
 
         mvp = projection @ view
         self._program["mvp"].write(mvp.astype(np.float32).T.tobytes())

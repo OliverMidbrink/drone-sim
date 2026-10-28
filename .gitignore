@@ -7,3 +7,5 @@ __pycache__/
 *.egg-info/
 .DS_Store
 exports/
+3D-SLAM/.phone-cert/
+*~

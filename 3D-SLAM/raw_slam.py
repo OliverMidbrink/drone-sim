@@ -96,6 +96,7 @@ class RawSlam:
         self.commits = 0  # pose steps taken
         self.fixes = 0  # anchor localizations applied
         self.skipped_no_scale = 0  # steps skipped because the map gave no scale
+        self.restarts = 0  # steps that began a new unit because the map had too few landmarks left
         self.failed_fits = 0  # parallax was there but the essential matrix failed
 
         # track id -> (pixel, camera rotation, camera centre) in the keyframe where the track first appeared
@@ -230,6 +231,14 @@ class RawSlam:
         """
         if self.commits == 0:
             return 1.0  # the very first step defines the unit of the map
+        if len(self.landmarks) < MIN_SCALE_LANDMARKS:
+            # The map holds too few points to ever give a scale again, and landmarks are only made
+            # by steps, so waiting would wait forever (all points lost, e.g. after fast motion).
+            # Start a new unit exactly like the very first step; anchor fixes later bring the
+            # live map back onto the old one, scale included.
+            self.restarts += 1
+            self.landmarks = {}
+            return 1.0
         rows = [i for i, track in enumerate(ids) if int(track) in self.landmarks]
         if len(rows) < MIN_SCALE_LANDMARKS:
             return None
@@ -399,5 +408,5 @@ class RawSlam:
     def describe(self) -> str:
         return (
             f"steps {self.commits}  fixes {self.fixes}  landmarks {len(self.landmarks)}  anchors {len(self.anchor_points)}  "
-            f"no-scale skips {self.skipped_no_scale}  failed fits {self.failed_fits}"
+            f"no-scale skips {self.skipped_no_scale}  restarts {self.restarts}  failed fits {self.failed_fits}"
         )
