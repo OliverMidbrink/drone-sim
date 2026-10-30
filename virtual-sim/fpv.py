@@ -124,6 +124,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "factory: it was calibrated once at the factory to --accel-cal-error, the filter sees 1 g at power-up to fix the gain and never estimates an offset (needs --slam to matter)")
     parser.add_argument("--accel-bias", choices=["auto", "online", "off"], default="auto", help="whether the filter estimates an accelerometer offset while flying (auto: yes with --accel online, no with --accel factory)")
     parser.add_argument("--accel-cal-error", type=float, default=None, help="with --accel factory: accelerometer gain error left after calibration (1-sigma, default 0.025 = 2.5 %%)")
+    parser.add_argument("--imu-only", action="store_true", help="with --slam: the position comes from the 6-axis IMU alone (no pictures are used or even processed). The accelerometer is integrated twice, "
+                        "so the estimate drifts away from the truth, and so does the drone, which flies on the estimate. Use --baro on to give it a height reference")
+    parser.add_argument("--att-kp", type=float, default=None, help="pull of the accelerometer on roll/pitch, 1/s (default 0.06; 0 = gyro only, the accelerometer's tilt reference is ignored)")
     parser.add_argument("--oracle", choices=["off", "pos", "pose"], default="off", help="with --slam: replace what each SLAM pose tells the filter by the truth (pos: the true position, "
                         "attitude left to the gyro; pose: true position and attitude), with --oracle-noise; the SLAM itself keeps running and is still logged. Tells apart errors of the SLAM from errors of the rest")
     parser.add_argument("--oracle-noise", type=float, default=0.02, help="metres of noise on each oracle position (1-sigma)")
@@ -218,6 +221,8 @@ class FpvApp:
             self.map_view = SlamMapView(ctx)
         else:
             estimator = StateEstimator()
+        if args.att_kp is not None:
+            estimator.kp = args.att_kp
         self.estimator = estimator
         self.controller = FlightController(self.quad.params, self.quad.mixer_inverse, estimator)
         self.controller.velocity_assist = args.assist and self.slam
@@ -512,7 +517,7 @@ class FpvApp:
                 climb=0.2 * ramp * np.sin(0.7 * w * s),
             )
             active = [n for n in self.cameras if self.camera_on[n]]
-            calibrated = active and all(est.scale_ready(n) for n in active)
+            calibrated = self.args.imu_only or (active and all(est.scale_ready(n) for n in active))  # imu-only: there is no scale to learn
             if (s > WIGGLE_MIN_SECONDS and calibrated) or s > WIGGLE_MAX_SECONDS:
                 self.start_hold(np.array([0.0, HOVER_HEIGHT, 0.0]))
                 self.hold_started = t
@@ -567,7 +572,7 @@ class FpvApp:
         quad = self.quad
         rotation = quad.rotation
         wanted = bool(self.frame_callbacks) or self.recorder is not None
-        slam_ready = self.link is not None and self.estimator.initialised and self.mission in ("wiggle", "hold", "route", "manual")  # the cameras start once airborne (after the IMU-only climb, which the accelerometer tracks to a few cm)
+        slam_ready = self.link is not None and not self.args.imu_only and self.estimator.initialised and self.mission in ("wiggle", "hold", "route", "manual")  # the cameras start once airborne (after the IMU-only climb, which the accelerometer tracks to a few cm)
         for name, camera in self.cameras.items():
             if not self.camera_on[name]:
                 continue
@@ -832,7 +837,8 @@ class FpvApp:
         roll, pitch, yaw = np.degrees(attitude_angles(quad.rotation))
         er, ep, ey = np.degrees(attitude_angles(ctl.estimator.rotation)) if ctl.estimator.initialised else (0.0, 0.0, 0.0)
         if self.slam:
-            mode = {"boot": "ON THE GROUND, CALIBRATING THE IMU", "takeoff": "TAKING OFF (IMU + cameras starting)", "wiggle": "START-UP WIGGLE (learning scale)", "hold": "POSITION HOLD (SLAM + IMU)", "route": f"ROUTE: waypoint {self.route.leg.target + 1 if self.route else 0}/4 (SLAM + IMU)", "manual": "MANUAL"}[self.mission]
+            fusion = "IMU ONLY" if self.args.imu_only else "SLAM + IMU"
+            mode = {"boot": "ON THE GROUND, CALIBRATING THE IMU", "takeoff": "TAKING OFF (IMU + cameras starting)", "wiggle": "START-UP WIGGLE (learning scale)", "hold": f"POSITION HOLD ({fusion})", "route": f"ROUTE: waypoint {self.route.leg.target + 1 if self.route else 0}/4 ({fusion})", "manual": "MANUAL"}[self.mission]
             if ctl.velocity_assist:
                 mode += " + VELOCITY ASSIST"
         else:
@@ -861,10 +867,10 @@ class FpvApp:
         truth = self.truth_in_w()
         target = self.target_point()
         lines = [
-            ("SLAM MAP (metres, drone's own estimate)    green: estimated path   magenta: true path   yellow +: hold point", (230, 230, 230)),
+            (("IMU-ONLY DEAD RECKONING" if self.args.imu_only else "SLAM MAP") + " (metres, drone's own estimate)    green: estimated path   magenta: true path   yellow +: hold point", (230, 230, 230)),
             (f"drift from the hold point (truth)  {np.linalg.norm(truth - target):.2f} m     estimate error {np.linalg.norm(est.position - truth):.2f} m     sim x{self.sim_rate:.2f}", (200, 255, 200)),
         ]
-        for name in self.cameras:
+        for name in self.cameras if not self.args.imu_only else ():
             stats = self.link.stats.get(name)
             if stats is None:
                 lines.append((f"{name}: waiting for the first picture", (150, 150, 150)))
