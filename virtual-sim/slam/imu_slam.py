@@ -26,6 +26,10 @@ INLIER_PX = 1.0
 MIN_DEROTATED_PARALLAX_PX = 3.0  # translation-only motion before a pose is computed
 GYRO_PRIOR_DEG = 0.4  # how far the pictures may pull the gyro's rotation over one keyframe interval
 PIXEL_SIGMA = 0.7
+# The step length the pictures give is held to what the accelerometer says the drone moved (see `_step_scale`).
+SCALE_BAND_SIGMAS = 3.0
+SCALE_BAND_FLOOR_M = 0.04  # error of the inertial displacement over one keyframe interval, metres
+SCALE_BAND_RELATIVE = 0.2  # ... and the part of it that grows with the distance moved
 
 
 def skew(v: np.ndarray) -> np.ndarray:
@@ -137,18 +141,53 @@ class ImuAidedSlam(RawSlam):
         self.key_gyro = np.eye(3)
         self.rng = np.random.default_rng(1)
         self.rotation_corrections = 0.0  # running sum of how far the pictures moved the gyro rotation (deg), for display
+        self.use_hint = True  # hold the step length to the inertial displacement when the flight computer has a calibrated scale
+        self.hint: tuple[np.ndarray, float, bool] | None = None  # (body position in metres, SLAM units per metre, scale calibrated)
+        self.key_position: np.ndarray | None = None  # the hint's position when the keyframe was set
         super().__init__(first_frame, intrinsic, exclude_mask)
         self.min_parallax = MIN_DEROTATED_PARALLAX_PX
 
-    def process(self, frame: np.ndarray, gyro_rotation: np.ndarray | None = None) -> bool:
-        """One BGR frame and the gyro-integrated rotation of the camera since the first frame (camera-now -> camera-first)."""
+    def process(self, frame: np.ndarray, gyro_rotation: np.ndarray | None = None, motion_hint=None) -> bool:
+        """One BGR frame, the gyro-integrated rotation of the camera since the first frame (camera-now -> camera-first), and
+        optionally what the flight computer's inertial filter says: (position in metres, SLAM units per metre, scale calibrated)."""
         if gyro_rotation is not None:
             self.gyro_rotation = gyro_rotation
+        self.set_motion_hint(motion_hint)
         return super().process(frame)
+
+    def set_motion_hint(self, motion_hint, keyframe: bool = False) -> None:
+        self.hint = None if motion_hint is None else (np.asarray(motion_hint[0], dtype=np.float64), float(motion_hint[1]), bool(motion_hint[2]))
+        if keyframe and self.hint is not None:
+            self.key_position = self.hint[0].copy()
 
     def _set_keyframe(self) -> None:
         super()._set_keyframe()
         self.key_gyro = self.gyro_rotation.copy()
+        self.key_position = None if self.hint is None else self.hint[0].copy()
+
+    def _step_scale(self, ids, current_px, rotation, direction):
+        """The map's step length, kept within what the accelerometer says the drone moved since the keyframe.
+
+        A monocular map has no memory of metres except its own landmarks, and in fast flight those are replaced within seconds:
+        every step then re-measures the scale from freshly triangulated points and the unit random-walks upward (measured: map
+        units per metre went from 4.4 to 130 in 20 s while the drone flew laps). The inertial filter knows the metric scale (learned
+        while the unit was young) and the accelerometer gives the distance over a keyframe interval to a few centimetres, so the
+        pictures only decide *inside* a band around it (clamped to its edge). In a hover the band is wide (the distance is below the
+        inertial noise) and the pictures decide alone. The metric scale handed in should be the one from the camera's start-up
+        calibration (fpv.py --scale-ref calibrated), not the filter's current one: the filter learns it from the SLAM, so a drifting
+        SLAM would drag its own bound along. Tried and measured worse: replacing an out-of-band step by the inertial one instead of
+        clamping it."""
+        scale = super()._step_scale(ids, current_px, rotation, direction)
+        if scale is None or not self.use_hint or self.hint is None or self.key_position is None or self.commits == 0:
+            return scale
+        position, per_metre, ready = self.hint
+        if not ready:
+            return scale
+        expected = per_metre * float(np.linalg.norm(position - self.key_position))
+        sigma = float(np.hypot(per_metre * SCALE_BAND_FLOOR_M, SCALE_BAND_RELATIVE * expected))
+        held = float(np.clip(scale, max(expected - SCALE_BAND_SIGMAS * sigma, 1e-6), expected + SCALE_BAND_SIGMAS * sigma))
+        self.telemetry.update(hint_expected=expected, hint_raw=float(scale), hint_held=float(held != scale))
+        return held
 
     def _rays(self, pixels: np.ndarray) -> np.ndarray:
         return np.column_stack([pixels, np.ones(len(pixels))]) @ self.intrinsic_inverse.T

@@ -3,7 +3,8 @@
 The worker is a sealed box. It is handed exactly what a real onboard computer would have:
 
     * the camera pictures (the fisheye frame, through shared memory),
-    * the gyro samples since the previous picture, and the gyro bias the flight computer estimated.
+    * the gyro samples since the previous picture, and the gyro bias the flight computer estimated,
+    * optionally the flight computer's inertial position and metric scale (accelerometer, never a map or the truth).
 
 It returns a camera pose in its own frame (the camera at its first picture is the origin, and its
 unit of length is whatever the first baseline was: a camera alone cannot know metres) plus its map.
@@ -16,7 +17,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pathlib import Path
 
@@ -36,6 +37,8 @@ class CameraConfig:
     lens_fov: float = 160.0  # field of view of the fisheye picture's image circle
     fixes: bool = True  # snap the pose to old anchors (loop-closure-like) now and then
     anchor_window: float = 0.0  # s after the first picture during which new anchors are made; 0 = always
+    anchor_refresh: bool = False  # True: anchors follow the live landmarks they sit on (that feeds pose errors back into the map; see raw_slam)
+    scale_hint: bool = True  # hold the step length to the inertial displacement once the flight computer's scale is calibrated
 
 
 @dataclass
@@ -46,6 +49,7 @@ class SlamResult:
     rotation: np.ndarray  # camera (OpenCV axes) -> SLAM frame
     position: np.ndarray  # camera centre in the SLAM frame, SLAM units
     stats: dict
+    telemetry: dict = field(default_factory=dict)  # numbers from inside the SLAM, for diagnostics
 
 
 def _expm(v: np.ndarray) -> np.ndarray:
@@ -86,11 +90,12 @@ def worker_main(config: CameraConfig, shm_name: str, inbox, outbox) -> None:
         if message[0] == "restart":
             state = fresh()
             continue
-        _, slot, t, gyro, bias = message
+        _, slot, t, gyro, bias, hint = message
         picture = cv2.remap(frames[slot], *maps, cv2.INTER_LINEAR)
         began = time.perf_counter()
         if state["slam"] is None:
             state["slam"] = ImuAidedSlam(picture, intrinsic)
+            state["slam"].set_motion_hint(hint, keyframe=True)
             state["last_t"] = t
             changed = True
         else:
@@ -100,8 +105,10 @@ def worker_main(config: CameraConfig, shm_name: str, inbox, outbox) -> None:
                     state["body"] = state["body"] @ _expm((row[1:4] - bias) * dt)
                     state["last_t"] = row[0]
             camera_rotation = rbc.T @ state["body"] @ rbc
-            changed = state["slam"].process(picture, camera_rotation)
+            state["slam"].use_hint = config.scale_hint
+            changed = state["slam"].process(picture, camera_rotation, hint)
         slam = state["slam"]
+        slam.refresh_anchors = config.anchor_refresh
         if config.anchor_window > 0.0 and state.setdefault("t0", t) + config.anchor_window < t:
             slam.make_anchors = False
         if changed and state["slam"].commits:
@@ -112,7 +119,7 @@ def worker_main(config: CameraConfig, shm_name: str, inbox, outbox) -> None:
             tracks=len(slam.track_points), steps=slam.commits, fixes=slam.fixes, restarts=slam.restarts, landmarks=len(slam.landmarks),
             skipped=slam.skipped_no_scale, failed=slam.failed_fits, corrected=slam.rotation_corrections, ms=1000.0 * state["spent"] / state["count"],
         )
-        outbox.put(("result", SlamResult(config.name, t, bool(changed), slam.world_rotation.copy(), slam.world_position.copy(), stats), slot))
+        outbox.put(("result", SlamResult(config.name, t, bool(changed), slam.world_rotation.copy(), slam.world_position.copy(), stats, dict(slam.telemetry)), slot))
         now = time.perf_counter()
         if now - state["map_at"] > MAP_EVERY and state["map"].count:
             state["map_at"] = now
@@ -168,8 +175,9 @@ class SlamLink:
         self.stats.clear()
         self.last_result.clear()
 
-    def submit(self, name: str, t: float, picture: np.ndarray, gyro: np.ndarray, bias: np.ndarray) -> None:
-        """One picture (BGR fisheye), the gyro rows [t, gx, gy, gz] since the previous picture, the flight computer's gyro bias."""
+    def submit(self, name: str, t: float, picture: np.ndarray, gyro: np.ndarray, bias: np.ndarray, hint=None) -> None:
+        """One picture (BGR fisheye), the gyro rows [t, gx, gy, gz] since the previous picture, the flight computer's gyro bias, and
+        optionally its inertial state: (body position in metres, SLAM units per metre for this camera, whether that scale is calibrated)."""
         while len(self.pending[name]) >= SLOTS - 1:  # all slots busy: the SLAM is behind, wait for it
             self._collect(block=True)
         slot = self.next_slot[name]
@@ -177,7 +185,7 @@ class SlamLink:
         self.frames[name][slot] = picture
         self.pending[name].append(t)
         self.started.setdefault(name, t)
-        self.inboxes[name].put(("frame", slot, t, gyro, bias))
+        self.inboxes[name].put(("frame", slot, t, gyro, bias, hint))
 
     def _collect(self, block: bool = False) -> None:
         import queue

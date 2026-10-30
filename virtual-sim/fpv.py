@@ -3,11 +3,13 @@
     python virtual-sim/fpv.py                       # random world, both side cameras
     python virtual-sim/fpv.py --seed 7 --low-mountains
     python virtual-sim/fpv.py --cams none           # no side cameras (fastest)
-    python virtual-sim/fpv.py --record out/         # also save left/right mp4, imu.csv and poses.csv
+    python virtual-sim/fpv.py --record out/         # record the flight: both videos (lossless), frame times, IMU, true poses, estimate, SLAM poses, meta.json
     python virtual-sim/fpv.py --screenshot hud.png  # fly a short scripted hop and save the screen, no window
 
     python virtual-sim/fpv.py --slam                # camera SLAM + IMU hold the drone in place (split screen)
     python virtual-sim/fpv.py --slam --hold-test 60 # same, no window: fly 60 s and report how far it wandered
+    python virtual-sim/fpv.py --slam --oracle pose  # the filter is told the TRUE pose instead of the SLAM's (to tell SLAM errors from the rest)
+    python virtual-sim/fpv.py --slam --accel factory  # factory-calibrated accelerometer (2.5 %), no offset estimated online
 
 You sit in the pilot's seat (the main view is the nose camera, tilted up like a real FPV
 quad). The drone levels itself and holds its height when you let go of the sticks.
@@ -45,6 +47,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+from collections import deque
 import queue
 import sys
 import threading
@@ -62,7 +66,7 @@ import paths  # noqa: E402,F401  (puts flight/, slam/, viewer/ on the path)
 from autopilot import FlightController, PilotInput  # noqa: E402
 from camera import Camera  # noqa: E402
 from collision import CollisionWorld  # noqa: E402
-from drone import Quadrotor, attitude_angles  # noqa: E402
+from drone import Quadrotor, attitude_angles, matrix_to_quat  # noqa: E402
 from fisheye import CameraMount, FisheyeCamera  # noqa: E402
 from hud import AXIS_COLORS, FONT, History, Overlay, draw_graph, fit_rect  # noqa: E402
 from lens import GL_TO_CV, mount_rotation  # noqa: E402
@@ -93,6 +97,7 @@ WIGGLE_AMPLITUDE = 0.3  # stick, during the start-up wiggle
 WIGGLE_HZ = 0.3
 WIGGLE_MIN_SECONDS = 4.0
 WIGGLE_MAX_SECONDS = 25.0
+ORACLE_UNIT = 4.0  # SLAM units per metre of the perfect SLAM that --oracle pretends to be
 GUST_SIGMA = 0.7  # m/s
 GUST_TIME = 3.0  # s
 
@@ -115,6 +120,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--baro", choices=["auto", "on", "off"], default="auto", help="barometer: auto = on for manual flight, off with --slam")
     parser.add_argument("--imu-errors", type=float, default=1.0, help="multiplies every IMU error (bias, drift, scale factor, coupling, noise, vibration): 1 = consumer MEMS, 0.3 = good, 0 = perfect apart from rounding")
     parser.add_argument("--cam-time-offset", type=float, default=0.006, help="seconds the camera timestamps lag the IMU clock (exposure and readout latency; --slam)")
+    parser.add_argument("--accel", choices=["online", "factory"], default="online", help="online: the accelerometer is as drawn (6 mg turn-on offset, 0.8 %% gain error) and the filter learns its offset while flying; "
+                        "factory: it was calibrated once at the factory to --accel-cal-error, the filter sees 1 g at power-up to fix the gain and never estimates an offset (needs --slam to matter)")
+    parser.add_argument("--accel-bias", choices=["auto", "online", "off"], default="auto", help="whether the filter estimates an accelerometer offset while flying (auto: yes with --accel online, no with --accel factory)")
+    parser.add_argument("--accel-cal-error", type=float, default=None, help="with --accel factory: accelerometer gain error left after calibration (1-sigma, default 0.025 = 2.5 %%)")
+    parser.add_argument("--oracle", choices=["off", "pos", "pose"], default="off", help="with --slam: replace what each SLAM pose tells the filter by the truth (pos: the true position, "
+                        "attitude left to the gyro; pose: true position and attitude), with --oracle-noise; the SLAM itself keeps running and is still logged. Tells apart errors of the SLAM from errors of the rest")
+    parser.add_argument("--oracle-noise", type=float, default=0.02, help="metres of noise on each oracle position (1-sigma)")
     parser.add_argument("--slam", action="store_true", help="run camera SLAM + IMU position hold, with the 3D map on the right half of the screen")
     parser.add_argument("--slam-size", type=int, default=512, help="pinhole picture (px, square) the SLAM works on, cut out of the fisheye picture")
     parser.add_argument("--slam-fov", type=float, default=110.0, help="field of view of that pinhole picture")
@@ -129,9 +141,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-dwell", type=float, default=1.0, help="seconds to hover at each waypoint")
     parser.add_argument("--wind", type=float, default=None, help="mean wind m/s (default 1.0 with --slam, else 0); gusts come on top")
     parser.add_argument("--anchor-window", type=float, default=0.0, metavar="SECONDS", help="make new SLAM anchors only during this many seconds after a camera's first picture (0 = always); old anchors keep being used")
+    parser.add_argument("--anchor-refresh", choices=["on", "off"], default="off", help="off (default): an anchor keeps the 3D position it was born with; on: it follows its live landmark (this feeds pose errors back into the map and lets the SLAM diverge)")
+    parser.add_argument("--scale-hint", choices=["on", "off"], default="on", help="hold each SLAM step length to the accelerometer's displacement once the scale is calibrated")
+    parser.add_argument("--scale-ref", choices=["filter", "calibrated"], default="calibrated", help="the metric scale the step-length hint uses: the filter's current one, or the one from when the camera was first calibrated")
+    parser.add_argument("--att-fusion", choices=["old", "new"], default="new", help="old: SLAM attitude only inside a 4 degree gate; new: wide gate with capped pull, plus learning the gyro's yaw bias from the SLAM heading")
     parser.add_argument("--diag", type=Path, default=None, metavar="PREFIX", help="with --slam: log truth vs estimate and every SLAM pose to PREFIX_state.csv / PREFIX_slam.csv (tools/diag_report.py summarises them)")
     parser.add_argument("--hold-test", type=float, default=None, metavar="SECONDS", help="with --slam: no window, fly this long, print how far the drone wandered")
-    parser.add_argument("--record", type=Path, default=None, help="folder for left.mp4, right.mp4, imu.csv and poses.csv")
+    parser.add_argument("--record", type=Path, default=None, help="record the flight into this folder: both camera videos, frame times, IMU, true poses, the drone's estimate, SLAM poses, events, meta.json (see Recorder)")
+    parser.add_argument("--record-codec", choices=["lossless", "mp4"], default="lossless", help="lossless: FFV1 .mkv, exact pixels so a SLAM can be re-run offline (large); mp4: small and lossy")
     parser.add_argument("--run-seconds", type=float, default=None, help="quit after this long and print frame rates (for benchmarking)")
     parser.add_argument("--screenshot", type=Path, default=None, help="fly a short scripted hop (or --hold-test), save the screen to this image and exit (no window)")
     parser.add_argument("--screenshot-seconds", type=float, default=8.0, help="how long the scripted flight for --screenshot lasts")
@@ -167,7 +184,10 @@ class FpvApp:
         self.view = args.view or ("chase" if args.slam else "fpv")
         self.last_draw = time.perf_counter()
         use_baro = args.baro == "on" or (args.baro == "auto" and not self.slam)
-        self.sensors = SensorSuite(SensorNoise().scaled(args.imu_errors), seed=seed, barometer=use_baro)
+        noise = SensorNoise().scaled(args.imu_errors)
+        if args.accel_cal_error is not None:
+            noise.accel_cal_gain = args.accel_cal_error
+        self.sensors = SensorSuite(noise, seed=seed, barometer=use_baro, accel_factory=args.accel == "factory")
 
         width, height = (int(v) for v in args.cam_size.lower().split("x"))
         forward = args.cam_layout == "forward"
@@ -189,9 +209,12 @@ class FpvApp:
             if width != height:
                 raise SystemExit("--slam needs square camera pictures (--cam-size NxN)")
             models = [CameraModel(m.name, mount_rotation(m.yaw_degrees) @ GL_TO_CV, m.offset.copy()) for m in mounts]
-            vio = VioConfig(align=args.vio_align == "on", turn_rate=0.6 if args.vio_turn_trust == "on" else 1e9)
+            vio = VioConfig(align=args.vio_align == "on", turn_rate=0.6 if args.vio_turn_trust == "on" else 1e9,
+                            accel_bias_online=(args.accel == "online") if args.accel_bias == "auto" else args.accel_bias == "online", accel_gravity_gain=args.accel == "factory")
+            if args.att_fusion == "old":
+                vio.attitude_gain, vio.attitude_gate_deg, vio.attitude_cap_deg, vio.attitude_bias_gain = 0.05, 4.0, 4.0, 0.0
             estimator = VisualInertialEstimator(models, vio, use_baro=use_baro)
-            self.link = SlamLink([CameraConfig(m.name, width, args.slam_size, args.slam_fov, mm.body_from_cv, args.cam_fov, args.slam_fixes == "on", args.anchor_window) for m, mm in zip(mounts, models)])
+            self.link = SlamLink([CameraConfig(m.name, width, args.slam_size, args.slam_fov, mm.body_from_cv, args.cam_fov, args.slam_fixes == "on", args.anchor_window, args.anchor_refresh == "on", args.scale_hint == "on") for m, mm in zip(mounts, models)])
             self.map_view = SlamMapView(ctx)
         else:
             estimator = StateEstimator()
@@ -207,7 +230,7 @@ class FpvApp:
         self.yaw_unwrapped = 0.0
         self.last_sample: SensorSample | None = None
         self.banner = ("", -1e9)
-        self.recorder: Recorder | None = Recorder(args.record, (width, height), args.cam_fps) if args.record else None
+        self.recorder: Recorder | None = Recorder(args.record, (width, height), args.cam_fps, args.record_codec) if args.record else None
         self.diag = None
         if args.diag and self.slam:
             from diagnostics import FlightDiagnostics
@@ -219,6 +242,7 @@ class FpvApp:
         self.strip_at = self.top_at = self.map_text_at = -1e9
         self.world = None
         self.rng = np.random.default_rng(seed + 1)
+        self.oracle_rng = np.random.default_rng(seed + 2)  # apart from self.rng so the wind is the same with or without --oracle
         self.sim_rate = 1.0
         self.load_world(seed)
         if window is not None and not headless:
@@ -277,6 +301,9 @@ class FpvApp:
         self.mission_started = 0.0
         self.auto_pilot = PilotInput()
         self.gyro_rows: dict[str, list] = {"left": [], "right": []}
+        self.truth_history: deque = deque(maxlen=500)  # (t, position in W, rotation in W) per IMU tick: what the oracle and the logs compare against
+        self.last_mission = ""
+        self.scale_ref: dict[str, float] = {}  # per camera: the filter's scale when it was first calibrated
         self.trail_estimate: list[np.ndarray] = []
         self.trail_truth: list[np.ndarray] = []
         self.hold_log: list[tuple[float, float, float]] = []  # t, true error, estimated error (m) while holding
@@ -289,6 +316,9 @@ class FpvApp:
         self.wind_mean = self.args.wind * np.array([np.cos(angle), 0.0, np.sin(angle)])
         if self.link is not None:
             self.link.restart()
+        if self.recorder:
+            self.recorder.event(0.0, "reset")
+            self.recorder.write_meta(self._meta())
         if self.map_view is not None:
             self.map_view.set_points(np.empty((0, 3)), np.empty((0, 3)))
 
@@ -301,6 +331,32 @@ class FpvApp:
     def truth_in_w(self) -> np.ndarray:
         """Where the drone really is, in the estimator's world axes (for judging the estimate; nothing reads this back)."""
         return self.w_axes.T @ (self.quad.position - self.start_position)
+
+    def truth_at(self, t: float) -> tuple[np.ndarray, np.ndarray]:
+        """The true position and orientation in W at simulated time t (the latest IMU tick not after it)."""
+        best = self.truth_history[0]
+        for entry in reversed(self.truth_history):
+            best = entry
+            if entry[0] <= t:
+                break
+        return best[1], best[2]
+
+    def _meta(self) -> dict:
+        """Everything about this run that is not a time series (for --record)."""
+        a = self.args
+        mounts = {}
+        for name, camera in self.cameras.items():
+            mount = camera.mount
+            mounts[name] = {"offset_body": mount.offset, "yaw_degrees": mount.yaw_degrees, "size": camera.size, "fisheye_fov_degrees": a.cam_fov,
+                            "body_from_cv": mount_rotation(mount.yaw_degrees) @ GL_TO_CV}
+        return {
+            "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()},
+            "world_seed": self.world.seed, "start_position": self.start_position,
+            "w_axes": self.w_axes, "w_axes_note": "columns are W's x, y, z in the simulator's world: truth_in_W = w_axes.T @ (position - start_position); body axes: x right, y up, z back (nose is -z)",
+            "cameras": mounts, "cam_fps": a.cam_fps, "cam_time_offset": a.cam_time_offset, "physics_hz": 1.0 / PHYSICS_DT, "imu_hz": 1.0 / (PHYSICS_DT * CONTROL_EVERY),
+            "imu_description": self.sensors.describe(), "imu_noise": vars(self.sensors.noise), "accel_mode": a.accel, "gravity": 9.81,
+            "accel_matrix_true": self.sensors.accel_matrix, "gyro_matrix_true": self.sensors.gyro_matrix,
+        }
 
     # --- input -----------------------------------------------------------------------------
 
@@ -413,6 +469,11 @@ class FpvApp:
             if self.mission == "route" and self.route is not None:
                 self.controller.reference = self.route.sample(sample.t)
             self.controller.update(sample, pilot, quad.on_ground)
+            self.truth_history.append((sample.t, self.truth_in_w(), self.w_axes.T @ quad.rotation))
+            if self.mission != self.last_mission:
+                self.last_mission = self.mission
+                if self.recorder:
+                    self.recorder.event(sample.t, f"mission {self.mission}")
             if self.diag is not None and self.tick % STATE_EVERY == 0:
                 self.diag.state_row(self)
             self._publish(sample)
@@ -462,7 +523,9 @@ class FpvApp:
         for callback in self.imu_callbacks:
             callback(sample)
         if self.recorder:
-            self.recorder.imu(sample, self.quad)
+            self.recorder.sample(sample, self.quad, self.sensors)
+            if self.tick % (5 * CONTROL_EVERY) == 0:
+                self.recorder.estimate(sample.t, self.mission, self.estimator, self.truth_in_w(), self.target_point())
         if self.link is not None and self.estimator.initialised:
             row = (sample.t, *sample.gyro)
             for rows in self.gyro_rows.values():
@@ -517,11 +580,9 @@ class FpvApp:
                 for callback in self.frame_callbacks:
                     callback(name, quad.time, frame)
                 if self.recorder:
-                    self.recorder.frame(name, frame)
+                    self.recorder.frame(name, frame, quad.time, quad.time - self.args.cam_time_offset)
                 if slam_ready:
                     self._submit_slam(name, frame)
-        if self.recorder:
-            self.recorder.pose(quad)
 
     def _submit_slam(self, name: str, frame: np.ndarray) -> None:
         """Hand the SLAM what a real drone's computer has: the picture and the gyro since the last picture."""
@@ -530,11 +591,19 @@ class FpvApp:
         buffer = self.gyro_rows[name]
         if name not in self.link.started:
             est.begin_camera(name)
+            self.scale_ref.pop(name, None)
             buffer.clear()
         cut = sum(1 for row in buffer if row[0] <= stamp)
         rows = np.array(buffer[:cut]).reshape(-1, 4)
         del buffer[:cut]
-        self.link.submit(name, stamp, frame, rows, est.gyro_bias.copy())
+        # The inertial filter's position and this camera's metric scale. --scale-ref calibrated hands back the scale the filter had when it first
+        # counted as calibrated (the start-up wiggle, a young map) instead of its current one: the filter learns its scale *from* the SLAM, so
+        # with the current one a SLAM whose unit drifts drags its own yardstick along.
+        if name not in self.scale_ref and est.scale_ready(name):
+            self.scale_ref[name] = est.scale(name)
+        calibrated = self.args.scale_ref == "calibrated" and name in self.scale_ref
+        hint = (est.x[0:3].copy(), self.scale_ref[name] if calibrated else est.scale(name), est.scale_ready(name))
+        self.link.submit(name, stamp, frame, rows, est.gyro_bias.copy(), hint)
 
     def _sync_slam(self) -> None:
         """Feed finished SLAM poses to the estimator; wait if the SLAM lags more than --slam-latency behind the simulation."""
@@ -549,9 +618,29 @@ class FpvApp:
             if DEBUG:
                 self._debug_pose(result)
             before = self.diag.before(self.estimator, result.name) if self.diag is not None else None
-            self.estimator.slam_pose(result.name, result.t, result.rotation, result.position)
+            if self.recorder:
+                self.recorder.slam_pose(result, matrix_to_quat(result.rotation))
+            if self.args.oracle != "off":
+                self.estimator.slam_pose(result.name, result.t, *self._oracle_pose(result))
+            else:
+                self.estimator.slam_pose(result.name, result.t, result.rotation, result.position)
             if self.diag is not None:
                 self.diag.pose(self, result, before)
+
+    def _oracle_pose(self, result) -> tuple[np.ndarray, np.ndarray]:
+        """--oracle: the pose a perfect SLAM with a fixed unit (ORACLE_UNIT per metre) would have reported for this picture.
+
+        Built from the truth, in the same form a real result has (camera -> S rotation, camera centre in S), so the filter takes exactly the
+        path it takes for a real one: its scale learning, gating, alignment, turn-distrust. Only the pictures' content is replaced."""
+        est, name = self.estimator, result.name
+        cam = est.cameras[name]
+        p_true, r_true = self.truth_at(result.t)
+        r_ws = est.start_rotation[name] @ cam.body_from_cv
+        body = r_true if self.args.oracle == "pose" else est._state_at(result.t)[2]  # "pos": the filter's own attitude, so there is nothing to correct
+        rotation_sc = r_ws.T @ body @ cam.body_from_cv
+        camera = p_true - est.start_position[name] + (r_true - est.start_rotation[name]) @ cam.lever_arm
+        camera = camera + self.oracle_rng.normal(0.0, self.args.oracle_noise, 3)
+        return rotation_sc, ORACLE_UNIT * (r_ws.T @ camera)
 
     def _debug_pose(self, result) -> None:
         """Developer check (DRONE_DEBUG=1): how wrong the SLAM's and the filter's attitude and position are against the truth. Nothing reads this back."""
@@ -900,34 +989,88 @@ class FpvApp:
 
 
 class Recorder:
-    """--record: the two camera streams as mp4, plus IMU and ground-truth pose logs for SLAM experiments."""
+    """--record FOLDER: everything a SLAM experiment needs to be repeated offline, and everything needed to judge it.
 
-    def __init__(self, folder: Path, size: tuple[int, int], fps: float) -> None:
+    left.mkv / right.mkv   the two camera pictures (--record-codec: lossless FFV1, or mp4)
+    frames.csv             one row per picture: camera, index, simulated time of the shutter, the camera clock's stamp (a little earlier)
+    imu.csv                what the flight controller reads, 250 Hz: gyro, accelerometer, barometer; and what is really there: the true
+                           turn rate and specific force, the sensors' true biases and temperature
+    poses.csv              the TRUE body pose, 250 Hz, in the simulator's world: position, orientation (body -> world), velocity, turn rate
+    estimate.csv           the drone's own estimate, 50 Hz, in the estimator's world W, next to the true position in W and the planned point
+    slam_poses.csv         every pose a SLAM worker finished: camera rotation and centre in that camera's own frame (SLAM units), counts
+    events.csv             resets and mission changes
+    meta.json              seed, command line, camera mounts and lens, the extrinsics, the sensor errors drawn for this run, how W relates to the world
+    """
+
+    def __init__(self, folder: Path, size: tuple[int, int], fps: float, codec: str = "lossless") -> None:
         folder.mkdir(parents=True, exist_ok=True)
-        self.writers = {name: cv2.VideoWriter(str(folder / f"{name}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, size) for name in ("left", "right")}
-        self.imu_file = open(folder / "imu.csv", "w", newline="")
-        self.pose_file = open(folder / "poses.csv", "w", newline="")
-        self.imu_writer, self.pose_writer = csv.writer(self.imu_file), csv.writer(self.pose_file)
-        self.imu_writer.writerow(["t", "gx", "gy", "gz", "ax", "ay", "az", "baro"])
-        self.pose_writer.writerow(["t", "x", "y", "z", "qw", "qx", "qy", "qz"])
+        self.folder, self.size, self.fps = folder, size, fps
+        extension, fourcc = ("mkv", "FFV1") if codec == "lossless" else ("mp4", "mp4v")
+        self.writers = {name: cv2.VideoWriter(str(folder / f"{name}.{extension}"), cv2.VideoWriter_fourcc(*fourcc), fps, size) for name in ("left", "right")}
+        for name, writer in self.writers.items():
+            if not writer.isOpened():
+                raise SystemExit(f"--record: could not open {folder / f'{name}.{extension}'} for writing ({fourcc}); try --record-codec mp4")
+        self.files, self.csv = {}, {}
+        columns = {
+            "frames": ["cam", "index", "t", "stamp"],
+            "imu": ["t", "gx", "gy", "gz", "ax", "ay", "az", "baro", "true_wx", "true_wy", "true_wz", "true_fx", "true_fy", "true_fz",
+                    "gyro_bias_x", "gyro_bias_y", "gyro_bias_z", "accel_bias_x", "accel_bias_y", "accel_bias_z", "temperature", "throttle"],
+            "poses": ["t", "x", "y", "z", "qw", "qx", "qy", "qz", "vx", "vy", "vz", "wx", "wy", "wz"],
+            "estimate": ["t", "mission", "est_x", "est_y", "est_z", "est_vx", "est_vy", "est_vz", "est_qw", "est_qx", "est_qy", "est_qz",
+                         "truth_w_x", "truth_w_y", "truth_w_z", "ref_x", "ref_y", "ref_z", "gyro_bias_est_x", "gyro_bias_est_y", "gyro_bias_est_z",
+                         "accel_bias_est_x", "accel_bias_est_y", "accel_bias_est_z", "scale_left", "scale_right"],
+            "slam_poses": ["t", "cam", "qw", "qx", "qy", "qz", "x", "y", "z", "steps", "landmarks", "tracks", "fixes", "restarts"],
+            "events": ["t", "event"],
+        }
+        for key, header in columns.items():
+            self.files[key] = open(folder / f"{key}.csv", "w", newline="")
+            self.csv[key] = csv.writer(self.files[key])
+            self.csv[key].writerow(header)
+        self.counts = {name: 0 for name in self.writers}
         self.queues = {name: queue.Queue(maxsize=8) for name in self.writers}
         self.threads = [threading.Thread(target=self._encode, args=(name,), daemon=True) for name in self.writers]  # cv2 releases the GIL while encoding
         for thread in self.threads:
             thread.start()
-        print(f"Recording to {folder}/")
+        print(f"Recording to {folder}/ ({codec})")
+
+    def write_meta(self, meta: dict) -> None:
+        (self.folder / "meta.json").write_text(json.dumps(meta, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
 
     def _encode(self, name: str) -> None:
         while (frame := self.queues[name].get()) is not None:
             self.writers[name].write(frame)
 
-    def frame(self, name: str, bgr: np.ndarray) -> None:
+    def frame(self, name: str, bgr: np.ndarray, t: float, stamp: float) -> None:
+        self.csv["frames"].writerow([name, self.counts[name], f"{t:.4f}", f"{stamp:.4f}"])
+        self.counts[name] += 1
         self.queues[name].put(bgr)  # waits when the encoder is behind, so no frame is dropped
 
-    def imu(self, s: SensorSample, quad: Quadrotor) -> None:
-        self.imu_writer.writerow([f"{s.t:.4f}", *map("{:.5f}".format, s.gyro), *map("{:.5f}".format, s.accel), "" if s.baro is None else f"{s.baro:.3f}"])
+    def sample(self, s: SensorSample, quad: Quadrotor, sensors: SensorSuite) -> None:
+        f = "{:.5f}".format
+        self.csv["imu"].writerow([
+            f"{s.t:.4f}", *map(f, s.gyro), *map(f, s.accel), "" if s.baro is None else f"{s.baro:.3f}",
+            *map(f, quad.omega), *map(f, sensors.last_force), *map(f, sensors.gyro_bias), *map(f, sensors.accel_bias),
+            f"{sensors.temperature:.2f}", f"{float(np.mean(quad.motors)):.3f}",
+        ])
+        self.csv["poses"].writerow([f"{quad.time:.4f}", *map("{:.4f}".format, quad.position), *map("{:.6f}".format, quad.q), *map("{:.4f}".format, quad.velocity), *map(f, quad.omega)])
 
-    def pose(self, quad: Quadrotor) -> None:
-        self.pose_writer.writerow([f"{quad.time:.4f}", *map("{:.4f}".format, quad.position), *map("{:.6f}".format, quad.q)])
+    def estimate(self, t: float, mission: str, est: StateEstimator, truth_w: np.ndarray, target: np.ndarray) -> None:
+        f = "{:.5f}".format
+        have = getattr(est, "x", None) is not None and est.position is not None
+        position = est.position if est.position is not None else np.full(3, np.nan)
+        velocity = est.velocity if est.velocity is not None else np.full(3, np.nan)
+        bias = est.x[6:9] if have else np.full(3, np.nan)
+        scales = [est.scale(n) if have else float("nan") for n in ("left", "right")]
+        self.csv["estimate"].writerow([f"{t:.4f}", mission, *map(f, position), *map(f, velocity), *map("{:.6f}".format, est.q), *map(f, truth_w), *map(f, target),
+                                       *map(f, est.gyro_bias), *map(f, bias), *[f"{v:.4f}" for v in scales]])
+
+    def slam_pose(self, result, quaternion: np.ndarray) -> None:
+        st = result.stats
+        self.csv["slam_poses"].writerow([f"{result.t:.4f}", result.name, *map("{:.6f}".format, quaternion), *map("{:.5f}".format, result.position),
+                                         st.get("steps", 0), st.get("landmarks", 0), st.get("tracks", 0), st.get("fixes", 0), st.get("restarts", 0)])
+
+    def event(self, t: float, text: str) -> None:
+        self.csv["events"].writerow([f"{t:.3f}", text])
 
     def close(self) -> None:
         for name, frames in self.queues.items():
@@ -936,8 +1079,8 @@ class Recorder:
             thread.join()
         for writer in self.writers.values():
             writer.release()
-        self.imu_file.close()
-        self.pose_file.close()
+        for file in self.files.values():
+            file.close()
 
 
 def main() -> None:

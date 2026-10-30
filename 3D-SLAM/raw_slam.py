@@ -12,7 +12,8 @@ What it does
      their baseline keeps growing, and every new observation is averaged in weighted by its
      triangulation angle squared. Depth therefore gets better the longer a point is tracked.
   5. A landmark with an ORB feature on top of it becomes an anchor (descriptor + 3D position,
-     kept up to date while the point is tracked). Every few steps the whole frame's ORB
+     frozen at the moment it was made: if anchors followed their live landmarks, every pose error
+     would be written into the map and the next fix would just confirm it). Every few steps the whole frame's ORB
      features are matched against all old anchors with no pose prior, and a PnP fit snaps the
      pose onto the map.
 
@@ -97,6 +98,9 @@ class RawSlam:
         self.commits = 0  # pose steps taken
         self.fixes = 0  # anchor localizations applied
         self.make_anchors = True  # experiments switch this off to refuse new anchors (existing ones stay and are still matched)
+        self.refresh_anchors = False  # True: an anchor follows the live landmark it sits on (measured to feed pose errors back into the map; see the docstring)
+        self.rekeys_without_step = 0  # keyframes replaced although the pose did not move with the camera (tracks lost / fit failed)
+        self.telemetry: dict[str, float] = {}  # latest numbers from inside a step / fix, for diagnostics only (nothing reads them back)
         self.skipped_no_scale = 0  # steps skipped because the map gave no scale
         self.restarts = 0  # steps that began a new unit because the map had too few landmarks left
         self.failed_fits = 0  # parallax was there but the essential matrix failed
@@ -180,7 +184,10 @@ class RawSlam:
         if len(self.track_points) < REFILL_BELOW:
             self._add_tracks(gray)
         if rekey:
+            if not changed:
+                self.rekeys_without_step += 1
             self._set_keyframe()
+        self.telemetry["rekeys_no_step"] = float(self.rekeys_without_step)
         self.prev_gray = gray
         return changed
 
@@ -268,7 +275,9 @@ class RawSlam:
         usable = np.isfinite(estimate) & (sensitivity > 1e-8) & (estimate > 0.0) & (weight > 0.0)
         if usable.sum() < MIN_SCALE_LANDMARKS:
             return None
-        return weighted_median(estimate[usable], weight[usable])
+        value = weighted_median(estimate[usable], weight[usable])
+        self.telemetry.update(step_scale=float(value), step_landmarks=float(usable.sum()), depth_med=float(np.median(a[usable, 2])), step_spread=float(np.percentile(estimate[usable], 75) / max(np.percentile(estimate[usable], 25), 1e-12)))
+        return value
 
     def _observe(self, ids: np.ndarray, current_px: np.ndarray) -> None:
         """Triangulate each point from the view it was born in to the current view and average it into its landmark."""
@@ -299,7 +308,11 @@ class RawSlam:
         point_second = self.world_position + along_second[:, None] * second
         gap = np.linalg.norm(point_first - point_second, axis=1)
         valid &= (along_first > 0) & (along_second > 0) & (gap < MAX_RAY_GAP * along_second)
-        weight = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))) ** 2
+        angle_deg = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+        weight = angle_deg**2
+        if valid.any():
+            ordered = np.sort(weight[valid])
+            self.telemetry.update(tri_valid=float(valid.mean()), tri_angle_med=float(np.median(angle_deg[valid])), tri_top_share=float(ordered[-max(1, len(ordered) // 10):].sum() / max(ordered.sum(), 1e-12)))
         midpoint = 0.5 * (point_first + point_second)
         for index in np.flatnonzero(valid):
             entry = self.landmarks.setdefault(int(ids[rows[index]]), np.zeros(4))
@@ -326,7 +339,7 @@ class RawSlam:
         ids = [int(self.track_ids[i]) for i in tracked]
         positions = np.array([self.landmarks[t][:3] / self.landmarks[t][3] for t in ids])
         have = [(k, self.anchor_row[t]) for k, t in enumerate(ids) if t in self.anchor_row]
-        if have:
+        if have and self.refresh_anchors:
             self.anchor_points[[row for _, row in have]] = positions[[k for k, _ in have]]
         fresh = [k for k, t in enumerate(ids) if t not in self.anchor_row]
         if not fresh or not self.make_anchors:
@@ -375,6 +388,15 @@ class RawSlam:
         rotation_world_to_camera = cv2.Rodrigues(rvec)[0]
         new_rotation = rotation_world_to_camera.T
         new_position = (-rotation_world_to_camera.T @ tvec).ravel()
+        rows_used = old[[m.trainIdx for m in good]][inliers]
+        alive_rows = {self.anchor_row[int(t)] for t in self.track_ids if int(t) in self.anchor_row}
+        age = self.commits - self.anchor_step[rows_used]
+        self.telemetry.update(
+            fix_matches=float(len(good)), fix_inliers=float(len(inliers)), fix_candidates=float(len(old)), fix_age_med=float(np.median(age)), fix_age_min=float(age.min()), fix_age_max=float(age.max()),
+            fix_live=float(np.mean([r in alive_rows for r in rows_used])),
+            fix_rot_deg=float(np.degrees(np.arccos(np.clip((np.trace(new_rotation.T @ self.world_rotation) - 1.0) / 2.0, -1.0, 1.0)))),
+            fix_move=float(np.linalg.norm(new_position - self.world_position)),
+        )
         self._carry_live_map(new_rotation, new_position, image[inliers], world[inliers])
         self.world_rotation, self.world_position = new_rotation, new_position
         self.fixes += 1
@@ -406,6 +428,8 @@ class RawSlam:
             usable = (depth_live > 1e-6) & (depth_anchor > 1e-6)
             if usable.sum() >= MIN_SCALE_LANDMARKS:
                 scale = float(np.median(depth_anchor[usable] / depth_live[usable]))
+            self.telemetry.update(fix_pairs=float(usable.sum()))
+        self.telemetry.update(fix_scale=scale)
 
         def carry(point: np.ndarray) -> np.ndarray:
             return new_position + scale * (relative @ (point - old_position))

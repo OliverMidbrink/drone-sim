@@ -29,10 +29,15 @@ STATE_COLUMNS = [
     "gyro_bias_err_x", "gyro_bias_err_y", "gyro_bias_err_z", "accel_bias_err_x", "accel_bias_err_y", "accel_bias_err_z",
     "temperature", "scale_left", "scale_right", "sigma_left", "sigma_right", "pos_sigma", "turn_rate", "throttle",
 ]
+TELEMETRY_COLUMNS = [  # numbers from inside the SLAM (latest step / fix)
+    "rekeys_no_step", "hint_expected", "hint_raw", "hint_held", "step_scale", "step_landmarks", "depth_med", "step_spread", "tri_valid", "tri_angle_med", "tri_top_share",
+    "fix_matches", "fix_inliers", "fix_candidates", "fix_age_med", "fix_age_min", "fix_age_max", "fix_live", "fix_rot_deg", "fix_move", "fix_scale", "fix_pairs",
+]
 SLAM_COLUMNS = [
     "t", "cam", "believed", "innovation", "distrust", "att_accepted",
     "slam_att_err_deg", "filter_att_err_deg", "slam_vs_filter_deg", "slam_pos_err_m", "true_scale", "filter_scale", "scale_ratio",
     "step_err_m", "fixes_total", "fix_now", "restarts", "steps", "landmarks", "tracks", "turn_rate",
+    *TELEMETRY_COLUMNS,
 ]
 
 
@@ -112,6 +117,7 @@ class FlightDiagnostics:
             f"{true_scale:.3f}", f"{lam:.3f}", f"{lam / true_scale if true_scale == true_scale and true_scale > 0 else float('nan'):.3f}",
             f"{step_err:.3f}", fixes, fix_now, result.stats.get("restarts", 0), result.stats.get("steps", 0), result.stats.get("landmarks", 0), result.stats.get("tracks", 0),
             f"{est.turn_rate:.3f}",
+            *[f"{result.telemetry.get(k, float('nan')):.4g}" for k in TELEMETRY_COLUMNS],
         ])
 
     def close(self) -> None:

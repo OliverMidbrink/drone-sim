@@ -76,6 +76,10 @@ class SensorNoise:
     gyro_range: float = 2000.0 * DEG  # saturation (not scaled)
     accel_range: float = 16.0 * G_UNIT
     baro_noise: float = 0.12  # m
+    # --- a factory-calibrated accelerometer (SensorSuite(accel_factory=True)): what is left of its static errors after a calibration
+    accel_cal_gain: float = 0.025  # axis gain error, 2.5 %: the calibration is good to 2-3 %
+    accel_cal_cross: float = 0.005  # axis coupling, rad
+    accel_cal_bias: float = 0.015  # m/s^2 offset (1.5 mg) at the calibration temperature
 
     _NOT_SCALED = ("bias_correlation_time", "warm_up", "thermal_time", "bandwidth", "gyro_lsb", "accel_lsb", "gyro_range", "accel_range")
 
@@ -87,17 +91,20 @@ class SensorNoise:
 class SensorSuite:
     AMBIENT = 25.0  # degrees C; the sensors' temperature coefficients are zero here
 
-    def __init__(self, noise: SensorNoise | None = None, seed: int = 0, barometer: bool = True) -> None:
+    def __init__(self, noise: SensorNoise | None = None, seed: int = 0, barometer: bool = True, accel_factory: bool = False) -> None:
         self.noise = noise or SensorNoise()
         self.rng = np.random.default_rng(seed)
+        self.calibration_rng = np.random.default_rng(seed + 7919)  # its own stream: the gyro and everything else draw the same sensor with or without calibration
         self.barometer = barometer
+        self.accel_factory = accel_factory
         self.reset(np.zeros(3))
 
-    def _misalignment(self, scale_sigma: float, cross_sigma: float) -> np.ndarray:
+    def _misalignment(self, scale_sigma: float, cross_sigma: float, rng: np.random.Generator | None = None) -> np.ndarray:
         """Scale-factor error on the diagonal and axis coupling off it: the matrix between the true signal and what the chip reports."""
-        matrix = np.eye(3) + np.diag(self.rng.normal(0.0, scale_sigma, 3))
+        rng = rng or self.rng
+        matrix = np.eye(3) + np.diag(rng.normal(0.0, scale_sigma, 3))
         off = ~np.eye(3, dtype=bool)
-        matrix[off] = self.rng.normal(0.0, cross_sigma, 6)
+        matrix[off] = rng.normal(0.0, cross_sigma, 6)
         return matrix
 
     def reset(self, velocity: np.ndarray) -> None:
@@ -107,6 +114,11 @@ class SensorSuite:
         self.gyro_matrix = self._misalignment(n.gyro_scale, n.gyro_misalignment)
         self.accel_matrix = self._misalignment(n.accel_scale, n.accel_misalignment)
         self.gyro_g_matrix = rng.normal(0.0, n.gyro_g_sensitivity, (3, 3))
+        if self.accel_factory:
+            # Calibrated once, at the factory, and never touched again: the accelerometer's turn-on errors are replaced by what a
+            # 2-3 % calibration leaves. The drift (temperature, wander, walk) and the noise below are still the chip's own.
+            self.accel_matrix = self._misalignment(n.accel_cal_gain, n.accel_cal_cross, self.calibration_rng)
+            self.accel_turn_on = self.calibration_rng.normal(0.0, n.accel_cal_bias, 3)
         self.gyro_tempco = rng.normal(0.0, n.gyro_tempco, 3)
         self.accel_tempco = rng.normal(0.0, n.accel_tempco, 3)
         self.gyro_wander = rng.normal(0.0, n.gyro_bias_instability, 3)  # Gauss-Markov, started in its stationary distribution
@@ -117,6 +129,7 @@ class SensorSuite:
         self.vibration_phase = rng.uniform(0.0, 2.0 * np.pi, 6)
         self.last_velocity = np.array(velocity, dtype=float)
         self.last_time: float | None = None
+        self.last_force = np.zeros(3)  # the true specific force of the latest sample (for logs)
 
     @property
     def gyro_bias(self) -> np.ndarray:
@@ -157,6 +170,7 @@ class SensorSuite:
         self.last_velocity, self.last_time = quad.velocity.copy(), quad.time
 
         force = quad.rotation.T @ (acceleration + np.array([0.0, GRAVITY, 0.0]))  # true specific force, body frame
+        self.last_force = force
         shake = n.vibration * throttle**2
         gyro_shake = n.gyro_vibration * throttle**2
         tone = np.sin(self.vibration_phase[:3]) * np.array([1.0, 0.7, 1.3]) + 0.4 * np.sin(self.vibration_phase[3:])

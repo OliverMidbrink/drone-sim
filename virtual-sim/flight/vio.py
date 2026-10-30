@@ -51,12 +51,16 @@ class CameraModel:
 class VioConfig:
     accel_noise: float = 0.25  # m/s^2: the accelerometer, plus the attitude error that leaks gravity into it
     bias_walk: float = 0.004  # m/s^2 per sqrt(s)
+    accel_bias_online: bool = True  # False: the accelerometer is taken as calibrated, its offset is never estimated (nothing for the SLAM to drag around)
+    accel_gravity_gain: bool = False  # True: at power-up, scale the accelerometer so it reads exactly 1 g while the drone sits still (fixes the vertical axis's gain)
     scale_walk: float = 0.02  # relative scale change per sqrt(s): a monocular SLAM's unit slowly drifts
     slam_position_noise: float = 0.15  # m: how well a SLAM pose is trusted
     gate: float = 25.0  # squared Mahalanobis distance above which a pose is not believed (3 degrees of freedom)
     gate_patience: int = 6  # ... until this many in a row disagree, then the filter believes them (they may be right)
-    attitude_gain: float = 0.05  # share of a SLAM orientation error corrected per picture
-    attitude_gate_deg: float = 4.0
+    attitude_gain: float = 0.1  # share of a SLAM orientation error corrected per picture
+    attitude_gate_deg: float = 20.0  # a SLAM attitude further than this from the filter's is not used at all
+    attitude_cap_deg: float = 4.0  # ... and the error counted for the pull never exceeds this (a robust, Huber-like pull: bounded, never locked out)
+    attitude_bias_gain: float = 0.004  # rad/s of gyro yaw-bias change per rad of heading disagreement, per picture (0 = off): heading is the only axis the accelerometer cannot see
     scale_prior: float = 3.0  # SLAM units per metre before anything is known
     scale_prior_sigma: float = 4.0
     baro_noise: float = 0.15
@@ -83,7 +87,9 @@ class VisualInertialEstimator(StateEstimator):
         cfg = self.config
         self.x = np.zeros(n)  # p (3), v (3), accelerometer bias (3), scale per camera
         self.x[9:] = cfg.scale_prior
-        self.P = np.diag([0.01**2] * 3 + [0.05**2] * 3 + [0.1**2] * 3 + [cfg.scale_prior_sigma**2] * len(self.cameras))
+        bias_sigma = 0.1 if cfg.accel_bias_online else 0.0  # a calibrated accelerometer has no unknown offset: zero variance, so no measurement ever moves it
+        self.P = np.diag([0.01**2] * 3 + [0.05**2] * 3 + [bias_sigma**2] * 3 + [cfg.scale_prior_sigma**2] * len(self.cameras))
+        self.accel_gain = 1.0
         self.position = self.x[0:3]
         self.velocity = self.x[3:6]
         self.history: deque = deque(maxlen=HISTORY)
@@ -127,7 +133,7 @@ class VisualInertialEstimator(StateEstimator):
         rotation = quat_to_matrix(self.q)
         x, cfg = self.x, self.config
         n = len(x)
-        acceleration = rotation @ (sample.accel - x[6:9]) + np.array([0.0, -GRAVITY, 0.0])
+        acceleration = rotation @ (self.accel_gain * sample.accel - x[6:9]) + np.array([0.0, -GRAVITY, 0.0])
         x[0:3] += x[3:6] * dt + 0.5 * acceleration * dt * dt
         x[3:6] += acceleration * dt
         f = np.eye(n)
@@ -135,7 +141,7 @@ class VisualInertialEstimator(StateEstimator):
         f[3:6, 6:9] = -rotation * dt
         q = np.zeros(n)
         q[3:6] = (cfg.accel_noise**2) * dt
-        q[6:9] = (cfg.bias_walk**2) * dt
+        q[6:9] = (cfg.bias_walk**2) * dt if cfg.accel_bias_online else 0.0
         q[9:] = (cfg.scale_walk * x[9:]) ** 2 * dt
         self.P = f @ self.P @ f.T + np.diag(q)
         self._ticks += 1
@@ -143,6 +149,11 @@ class VisualInertialEstimator(StateEstimator):
             self._scalar_update(1, sample.baro - self._baro0, cfg.baro_noise**2)
         self.altitude, self.climb_rate = float(x[1]), float(x[4])
         self._store(sample.t, rotation)
+
+    def _calibrate(self, sample: SensorSample) -> None:
+        super()._calibrate(sample)
+        if self.initialised and self.config.accel_gravity_gain:
+            self.accel_gain = GRAVITY / float(np.linalg.norm(self._cal_accel / self._cal_n))  # sitting still, the accelerometer feels exactly 1 g
 
     def update_vertical(self, sample: SensorSample) -> None:  # the base class's baro/accel blend is replaced by the filter
         pass
@@ -259,7 +270,13 @@ class VisualInertialEstimator(StateEstimator):
         if angle < 1e-9:
             return
         axis = np.array([error_body[2, 1] - error_body[1, 2], error_body[0, 2] - error_body[2, 0], error_body[1, 0] - error_body[0, 1]]) / (2.0 * np.sin(angle))
-        correction_world = r_then @ (axis * angle * self.config.attitude_gain * weight)
+        pulled = min(angle, np.radians(self.config.attitude_cap_deg))
+        correction_world = r_then @ (axis * pulled * self.config.attitude_gain * weight)
+        if self.config.attitude_bias_gain > 0.0:
+            # A heading that the pictures keep correcting the same way is the gyro's yaw bias: hand it to the gyro integrator (about the vertical only).
+            up_body = r_then[1, :]
+            yaw_error = float(np.clip(np.dot(axis * angle, up_body), -pulled, pulled))
+            self._integral += self.config.attitude_bias_gain * weight * yaw_error * up_body
         half = 0.5 * correction_world
         dq = np.array([1.0, *half])
         dq /= np.linalg.norm(dq)
