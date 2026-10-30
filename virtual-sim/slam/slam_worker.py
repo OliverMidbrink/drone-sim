@@ -35,6 +35,7 @@ class CameraConfig:
     cv_camera_to_body: np.ndarray  # extrinsics: calibration, not truth
     lens_fov: float = 160.0  # field of view of the fisheye picture's image circle
     fixes: bool = True  # snap the pose to old anchors (loop-closure-like) now and then
+    anchor_window: float = 0.0  # s after the first picture during which new anchors are made; 0 = always
 
 
 @dataclass
@@ -101,6 +102,8 @@ def worker_main(config: CameraConfig, shm_name: str, inbox, outbox) -> None:
             camera_rotation = rbc.T @ state["body"] @ rbc
             changed = state["slam"].process(picture, camera_rotation)
         slam = state["slam"]
+        if config.anchor_window > 0.0 and state.setdefault("t0", t) + config.anchor_window < t:
+            slam.make_anchors = False
         if changed and state["slam"].commits:
             _update_map(state["map"], slam, picture)
         state["spent"] += time.perf_counter() - began

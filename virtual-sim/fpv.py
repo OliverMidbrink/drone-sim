@@ -128,6 +128,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-accel", type=float, default=2.0, help="largest acceleration the route may ask for (m/s^2); 9.81 * tan(tilt)")
     parser.add_argument("--route-dwell", type=float, default=1.0, help="seconds to hover at each waypoint")
     parser.add_argument("--wind", type=float, default=None, help="mean wind m/s (default 1.0 with --slam, else 0); gusts come on top")
+    parser.add_argument("--anchor-window", type=float, default=0.0, metavar="SECONDS", help="make new SLAM anchors only during this many seconds after a camera's first picture (0 = always); old anchors keep being used")
     parser.add_argument("--diag", type=Path, default=None, metavar="PREFIX", help="with --slam: log truth vs estimate and every SLAM pose to PREFIX_state.csv / PREFIX_slam.csv (tools/diag_report.py summarises them)")
     parser.add_argument("--hold-test", type=float, default=None, metavar="SECONDS", help="with --slam: no window, fly this long, print how far the drone wandered")
     parser.add_argument("--record", type=Path, default=None, help="folder for left.mp4, right.mp4, imu.csv and poses.csv")
@@ -190,7 +191,7 @@ class FpvApp:
             models = [CameraModel(m.name, mount_rotation(m.yaw_degrees) @ GL_TO_CV, m.offset.copy()) for m in mounts]
             vio = VioConfig(align=args.vio_align == "on", turn_rate=0.6 if args.vio_turn_trust == "on" else 1e9)
             estimator = VisualInertialEstimator(models, vio, use_baro=use_baro)
-            self.link = SlamLink([CameraConfig(m.name, width, args.slam_size, args.slam_fov, mm.body_from_cv, args.cam_fov, args.slam_fixes == "on") for m, mm in zip(mounts, models)])
+            self.link = SlamLink([CameraConfig(m.name, width, args.slam_size, args.slam_fov, mm.body_from_cv, args.cam_fov, args.slam_fixes == "on", args.anchor_window) for m, mm in zip(mounts, models)])
             self.map_view = SlamMapView(ctx)
         else:
             estimator = StateEstimator()

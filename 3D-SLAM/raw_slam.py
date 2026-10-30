@@ -96,6 +96,7 @@ class RawSlam:
         self.world_position = np.zeros(3)  # camera centre in the world
         self.commits = 0  # pose steps taken
         self.fixes = 0  # anchor localizations applied
+        self.make_anchors = True  # experiments switch this off to refuse new anchors (existing ones stay and are still matched)
         self.skipped_no_scale = 0  # steps skipped because the map gave no scale
         self.restarts = 0  # steps that began a new unit because the map had too few landmarks left
         self.failed_fits = 0  # parallax was there but the essential matrix failed
@@ -328,7 +329,7 @@ class RawSlam:
         if have:
             self.anchor_points[[row for _, row in have]] = positions[[k for k, _ in have]]
         fresh = [k for k, t in enumerate(ids) if t not in self.anchor_row]
-        if not fresh:
+        if not fresh or not self.make_anchors:
             return
         keypoint_xy = np.array([k.pt for k in keypoints], dtype=np.float32)
         distance = np.linalg.norm(keypoint_xy[:, None, :] - self.track_points[[tracked[k] for k in fresh]][None, :, :], axis=2)
