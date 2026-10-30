@@ -10,3 +10,7 @@ exports/
 3D-SLAM/.phone-cert/
 *~
 virtual-sim/out/
+
+reference/
+office-playground-sim/out/
+office-playground-sim/office/assets/

@@ -1,4 +1,4 @@
-"""Minimal glTF 2.0 reader (.gltf + .bin files): triangle meshes baked into world space, with base-colour textures.
+"""Minimal glTF 2.0 reader (.gltf + .bin files, or a single .glb): triangle meshes baked into world space, with base-colour textures.
 
 Handles what the Godot forest demo's Sketchfab exports use: node matrices or TRS, interleaved
 buffers, the metallic-roughness and the specular-glossiness extension's base colour, and the alpha
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
@@ -37,8 +38,29 @@ class Model:
     primitives: list[Primitive] = field(default_factory=list)
 
 
-def _read_buffer(base: Path, buffer: dict) -> bytes:
-    uri = buffer.get("uri", "")
+def _read_container(path: Path) -> tuple[dict, bytes | None]:
+    """(JSON document, embedded binary chunk) of a .gltf or a .glb file."""
+    data = path.read_bytes()
+    if data[:4] != b"glTF":
+        return json.loads(data.decode("utf-8")), None
+    document, binary, offset = {}, None, 12  # the 12 byte header: magic, version, total length
+    while offset < len(data):
+        length, kind = struct.unpack_from("<II", data, offset)
+        chunk = data[offset + 8 : offset + 8 + length]
+        if kind == 0x4E4F534A:  # "JSON"
+            document = json.loads(chunk.decode("utf-8"))
+        elif kind == 0x004E4942:  # "BIN\0"
+            binary = chunk
+        offset += 8 + length
+    return document, binary
+
+
+def _read_buffer(base: Path, buffer: dict, embedded: bytes | None = None) -> bytes:
+    uri = buffer.get("uri")
+    if uri is None:
+        if embedded is None:
+            raise ValueError("buffer without a uri and no .glb binary chunk")
+        return embedded
     if uri.startswith("data:"):
         return base64.b64decode(uri.split(",", 1)[1])
     return (base / unquote(uri)).read_bytes()
@@ -119,8 +141,8 @@ def _load_texture(path: Path, max_size: int) -> np.ndarray | None:
 
 def load_gltf(path: Path, max_texture: int = 1024) -> Model:
     """All meshes of the file's default scene with every node transform applied."""
-    document = json.loads(path.read_text())
-    buffers = [_read_buffer(path.parent, buffer) for buffer in document["buffers"]]
+    document, embedded = _read_container(path)
+    buffers = [_read_buffer(path.parent, buffer, embedded) for buffer in document["buffers"]]
     textures: dict[int, np.ndarray | None] = {}
     model = Model()
     for mesh_index, matrix in _mesh_instances(document):
