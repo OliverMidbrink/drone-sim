@@ -105,6 +105,21 @@ class VisualInertialEstimator(StateEstimator):
         self._ticks = 0
         self.turn_rate = 0.0  # |gyro - bias|, rad/s, smoothed over ~0.1 s
         self.last_distrust = {name: 1.0 for name in self.cameras}
+        self.locked: set[int] = set()  # scale states held fixed (lock_scale)
+
+    def lock_scale(self, name: str, value: float, relative_sigma: float = 0.03) -> None:
+        """Hold a camera's scale at `value` from now on (a "consider" state: its uncertainty still enters every update, but no update moves it).
+
+        Measured: once calibrated, the SLAM map keeps its unit within about 10% (its steps are held to the accelerometer at the calibrated
+        scale), but a free scale state in this filter wandered off to twice that over two minutes. Scale and position are only told
+        apart by the accelerometer's double integral, a weak signal, so any jump in the SLAM pose leaks partly into the scale and
+        nothing pulls it back. The map's unit is set by the calibrated scale; the filter should read it with that same unit."""
+        i = self.camera_index[name]
+        self.x[i] = value
+        self.P[i, :] = 0.0
+        self.P[:, i] = 0.0
+        self.P[i, i] = (relative_sigma * value) ** 2
+        self.locked.add(i)
 
     def begin_camera(self, name: str) -> None:
         """Call at the moment a camera's SLAM takes its first picture: that picture's pose defines the frame S_i."""
@@ -113,6 +128,7 @@ class VisualInertialEstimator(StateEstimator):
         self.updates[name] = 0
         self.x[self.camera_index[name]] = self.config.scale_prior
         i = self.camera_index[name]
+        self.locked.discard(i)
         self.P[i, :] = 0.0
         self.P[:, i] = 0.0
         self.P[i, i] = self.config.scale_prior_sigma**2
@@ -143,6 +159,8 @@ class VisualInertialEstimator(StateEstimator):
         q[3:6] = (cfg.accel_noise**2) * dt
         q[6:9] = (cfg.bias_walk**2) * dt if cfg.accel_bias_online else 0.0
         q[9:] = (cfg.scale_walk * x[9:]) ** 2 * dt
+        for i in self.locked:
+            q[i] = 0.0
         self.P = f @ self.P @ f.T + np.diag(q)
         self._ticks += 1
         if self.use_baro and sample.baro is not None and self._baro0 is not None and self._ticks % 5 == 0:
@@ -189,7 +207,7 @@ class VisualInertialEstimator(StateEstimator):
                 break
         return best
 
-    def slam_pose(self, name: str, t: float, rotation_sc: np.ndarray, position_s: np.ndarray) -> None:
+    def slam_pose(self, name: str, t: float, rotation_sc: np.ndarray, position_s: np.ndarray, extra_sigma: float = 0.0) -> None:
         """A SLAM pose of camera `name` for the picture taken at time t: the camera (OpenCV axes) -> S_i rotation and its centre in S_i."""
         if name not in self.start_rotation or not self.initialised or not self.history:
             return
@@ -222,6 +240,7 @@ class VisualInertialEstimator(StateEstimator):
         h[:, 0:3] = lam * np.eye(3)
         h[:, i] = base
         variance = ((lam * cfg.slam_position_noise) ** 2 + (0.03 * np.linalg.norm(measured)) ** 2 + 1e-8) * distrust
+        variance += (lam * extra_sigma) ** 2  # a pose that came with an anchor fix carries the anchors' frozen errors: believed less
         covariance = variance * np.eye(3)
         s = h @ self.P @ h.T + covariance
         distance = float(innovation @ np.linalg.solve(s, innovation))
@@ -235,6 +254,8 @@ class VisualInertialEstimator(StateEstimator):
             s = h @ self.P @ h.T + covariance
         self._streak[name] = 0
         k = self.P @ h.T @ np.linalg.inv(s)
+        for locked in self.locked:
+            k[locked, :] = 0.0
         self.x += k @ innovation
         identity = np.eye(n)
         joseph = identity - k @ h

@@ -1,6 +1,7 @@
 """FPV drone mode: fly a quadrotor with real thruster physics through the virtual world.
 
-    python virtual-sim/fpv.py                       # random world, both side cameras
+    python virtual-sim/fpv.py                       # random world, the two-camera side rig (--cam-layout sides, the default)
+    python virtual-sim/fpv.py --cam-layout down     # ONE camera looking straight down (needs --slam-mode separate)
     python virtual-sim/fpv.py --seed 7 --low-mountains
     python virtual-sim/fpv.py --cams none           # no side cameras (fastest)
     python virtual-sim/fpv.py --record out/         # record the flight: both videos (lossless), frame times, IMU, true poses, estimate, SLAM poses, meta.json
@@ -50,6 +51,7 @@ import csv
 import json
 from collections import deque
 import queue
+import os
 import sys
 import threading
 import time
@@ -66,7 +68,7 @@ import paths  # noqa: E402,F401  (puts flight/, slam/, viewer/ on the path)
 from autopilot import FlightController, PilotInput  # noqa: E402
 from camera import Camera  # noqa: E402
 from collision import CollisionWorld  # noqa: E402
-from drone import Quadrotor, attitude_angles, matrix_to_quat  # noqa: E402
+from drone import Quadrotor, attitude_angles, matrix_to_quat, wrap_angle  # noqa: E402
 from fisheye import CameraMount, FisheyeCamera  # noqa: E402
 from hud import AXIS_COLORS, FONT, History, Overlay, draw_graph, fit_rect  # noqa: E402
 from lens import GL_TO_CV, mount_rotation  # noqa: E402
@@ -106,7 +108,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_world_arguments(parser)
     parser.add_argument("--cams", choices=["both", "left", "right", "none"], default="both", help="which side cameras start enabled")
-    parser.add_argument("--cam-layout", choices=["sides", "forward"], default="sides", help="sides: look out of the left and right; forward: a forward-looking stereo pair")
+    parser.add_argument("--cam-layout", choices=["down", "sides", "forward"], default="sides", help="down: ONE camera looking straight down (the setup to tune first); sides: the two-camera rig looking out of the left and right; forward: a forward-looking stereo pair")
     parser.add_argument("--cam-size", default=None, help="side camera picture size, square (default 1080x1080, 768x768 with --slam): the 180 degree image circle fills it")
     parser.add_argument("--cam-face", type=int, default=None, help="resolution of the five cube faces behind each fisheye picture (lower = faster; default 1024, 640 with --slam)")
     parser.add_argument("--cam-fov", type=float, default=160.0, help="field of view of the side cameras' fisheye lenses in degrees (image circle across the square picture; 180 = hemisphere)")
@@ -117,8 +119,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--chase-fov", type=float, default=75.0, help="chase view horizontal field of view")
     parser.add_argument("--view-tilt", type=float, default=10.0, help="degrees the pilot camera is tilted up")
     parser.add_argument("--assist", action="store_true", help="start with the velocity assist on (H toggles; needs --slam)")
-    parser.add_argument("--baro", choices=["auto", "on", "off"], default="auto", help="barometer: auto = on for manual flight, off with --slam")
-    parser.add_argument("--imu-errors", type=float, default=1.0, help="multiplies every IMU error (bias, drift, scale factor, coupling, noise, vibration): 1 = consumer MEMS, 0.3 = good, 0 = perfect apart from rounding")
+    parser.add_argument("--baro", choices=["auto", "on", "off"], default="auto", help="barometer: auto = on for manual flight and for the downward camera (--cam-layout down), off with the other --slam setups")
+    parser.add_argument("--imu-errors", type=float, default=1.0, help="multiplies every IMU error (bias, drift, scale factor, coupling, noise, vibration): 1 = datasheet-typical drone IMU, 0.3 = good, 0 = perfect apart from rounding")
+    parser.add_argument("--imu-chip", choices=["bmi088", "icm42688"], default="bmi088", help="which datasheet the IMU errors follow: Bosch BMI088 or the quieter TDK ICM-42688-P (propeller vibration is the same)")
+    parser.add_argument("--imu-filter", type=float, nargs=2, metavar=("ACCEL_HZ", "GYRO_HZ"), default=[25.0, 80.0], help="software low-pass cutoffs the flight controller applies to the raw accelerometer and gyro (0 = off)")
     parser.add_argument("--cam-time-offset", type=float, default=0.006, help="seconds the camera timestamps lag the IMU clock (exposure and readout latency; --slam)")
     parser.add_argument("--accel", choices=["online", "factory"], default="online", help="online: the accelerometer is as drawn (6 mg turn-on offset, 0.8 %% gain error) and the filter learns its offset while flying; "
                         "factory: it was calibrated once at the factory to --accel-cal-error, the filter sees 1 g at power-up to fix the gain and never estimates an offset (needs --slam to matter)")
@@ -126,6 +130,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--accel-cal-error", type=float, default=None, help="with --accel factory: accelerometer gain error left after calibration (1-sigma, default 0.025 = 2.5 %%)")
     parser.add_argument("--imu-only", action="store_true", help="with --slam: the position comes from the 6-axis IMU alone (no pictures are used or even processed). The accelerometer is integrated twice, "
                         "so the estimate drifts away from the truth, and so does the drone, which flies on the estimate. Use --baro on to give it a height reference")
+    parser.add_argument("--fix-gain", type=float, default=1.0, help="share of the way the SLAM pose moves toward each anchor fix (1 = snap to it, the old behaviour; 0.25 = soft)")
+    parser.add_argument("--fix-guard", choices=["on", "off"], default="off", help="refuse an anchor fix further from the pose than the inertial data makes plausible")
+    parser.add_argument("--fix-prior", choices=["on", "off"], default="off", help="only match anchors whose picture position, under the current pose, is plausible given the inertial uncertainty")
+    parser.add_argument("--fix-blame", choices=["on", "off"], default="off", help="find the anchors that pull a suspicious fix away from the inertial pose and ban the repeat offenders")
+    parser.add_argument("--fix-zmax", type=float, default=3.0, help="with --fix-guard: refuse a fix further than this many budgets (sigma floor + drift allowance) from the current pose")
+    parser.add_argument("--fix-sigma", type=float, default=0.0, help="metres of extra position noise the filter assumes for the SLAM pose of a picture that had an anchor fix (0 = none)")
     parser.add_argument("--att-kp", type=float, default=None, help="pull of the accelerometer on roll/pitch, 1/s (default 0.06; 0 = gyro only, the accelerometer's tilt reference is ignored)")
     parser.add_argument("--oracle", choices=["off", "pos", "pose"], default="off", help="with --slam: replace what each SLAM pose tells the filter by the truth (pos: the true position, "
                         "attitude left to the gyro; pose: true position and attitude), with --oracle-noise; the SLAM itself keeps running and is still logged. Tells apart errors of the SLAM from errors of the rest")
@@ -133,6 +143,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--slam", action="store_true", help="run camera SLAM + IMU position hold, with the 3D map on the right half of the screen")
     parser.add_argument("--slam-size", type=int, default=512, help="pinhole picture (px, square) the SLAM works on, cut out of the fisheye picture")
     parser.add_argument("--slam-fov", type=float, default=110.0, help="field of view of that pinhole picture")
+    parser.add_argument("--slam-mode", choices=["separate", "rig"], default="rig", help="rig: one SLAM for both cameras (one map, one scale, one pose of the drone body; see slam/rig_slam.py); separate: one independent SLAM per camera (own map, own scale, two filter measurements)")
+    parser.add_argument("--rig-opts", default="", help="experiments with --slam-mode rig, comma separated: gyro-rot (take the body rotation from the gyro alone), no-lever (treat the rig as a point), "
+                        "lever-at-cal (the old lens offset: zero until the scale is calibrated), shared-keys (one keyframe for both cameras), separate-motion (with shared-keys: per-camera motion fits), no-side-check (always use the joint fix)")
+    parser.add_argument("--map", choices=["raw", "best"], default="raw", help="anchor map management: raw (every landmark anchored at once, matched against the whole map) or best (ORB-SLAM-style: parallax-checked anchors, fused duplicates, search by projection, culling, no rescaling fixes once calibrated)")
+    parser.add_argument("--map-off", default="", help="with --map best, switch parts off (comma separated): gate, fuse, guided, cull, rigid")
+    parser.add_argument("--scale-lock", choices=["on", "off"], default="on", help="on: once a camera's scale is calibrated the filter holds it there (the SLAM's steps are held to that same scale)")
     parser.add_argument("--slam-fixes", choices=["on", "off"], default="on", help="let the SLAM snap its pose to old landmarks (loop-closure-like)")
     parser.add_argument("--vio-align", choices=["on", "off"], default="on", help="turn each SLAM position by how far the SLAM's frame has turned from the filter's attitude")
     parser.add_argument("--vio-turn-trust", choices=["on", "off"], default="on", help="believe pictures less while the drone turns fast (the IMU carries the filter instead)")
@@ -142,6 +158,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-speed", type=float, default=2.0, help="fastest the route may fly (m/s)")
     parser.add_argument("--route-accel", type=float, default=2.0, help="largest acceleration the route may ask for (m/s^2); 9.81 * tan(tilt)")
     parser.add_argument("--route-dwell", type=float, default=1.0, help="seconds to hover at each waypoint")
+    parser.add_argument("--route-yaw", type=float, default=0.0, metavar="DEG", help="turn the heading by this much during the dwell at every waypoint (0 = hold the heading; 90 makes each side camera look where the other one looked)")
     parser.add_argument("--wind", type=float, default=None, help="mean wind m/s (default 1.0 with --slam, else 0); gusts come on top")
     parser.add_argument("--anchor-window", type=float, default=0.0, metavar="SECONDS", help="make new SLAM anchors only during this many seconds after a camera's first picture (0 = always); old anchors keep being used")
     parser.add_argument("--anchor-refresh", choices=["on", "off"], default="off", help="off (default): an anchor keeps the 3D position it was born with; on: it follows its live landmark (this feeds pose errors back into the map and lets the SLAM diverge)")
@@ -179,6 +196,10 @@ class FpvApp:
     def __init__(self, args: argparse.Namespace, seed: int, window, ctx, headless: bool = False) -> None:
         self.args, self.window, self.ctx, self.headless = args, window, ctx, headless
         self.slam = args.slam
+        if args.cam_layout == "down" and args.slam_mode == "rig":
+            raise SystemExit("--slam-mode rig needs two cameras: use --cam-layout sides")
+        self.rig_mode = bool(args.slam) and args.slam_mode == "rig"
+        self.slam_names = ["rig"] if self.rig_mode else (["left"] if args.cam_layout == "down" else ["left", "right"])  # what the SLAM and the estimator call their cameras
         self.models = load_models(args.godot_dir) if args.trees > 0 else []
         self.renderer = Renderer(ctx, self.models, args.visibility)
         self.overlay = Overlay(ctx)
@@ -186,38 +207,45 @@ class FpvApp:
         self.drone_model = DroneModel(ctx, self.quad.params, SUN_DIRECTION)
         self.view = args.view or ("chase" if args.slam else "fpv")
         self.last_draw = time.perf_counter()
-        use_baro = args.baro == "on" or (args.baro == "auto" and not self.slam)
-        noise = SensorNoise().scaled(args.imu_errors)
+        use_baro = args.baro == "on" or (args.baro == "auto" and (not self.slam or args.cam_layout == "down"))  # the downward setup flies with a barometer: its vertical motion is along the optical axis, where the camera alone cannot learn the scale at start-up
+        noise = (SensorNoise.icm42688() if args.imu_chip == "icm42688" else SensorNoise()).scaled(args.imu_errors)
         if args.accel_cal_error is not None:
             noise.accel_cal_gain = args.accel_cal_error
         self.sensors = SensorSuite(noise, seed=seed, barometer=use_baro, accel_factory=args.accel == "factory")
 
         width, height = (int(v) for v in args.cam_size.lower().split("x"))
         forward = args.cam_layout == "forward"
-        mounts = [
-            CameraMount("left", np.array([-0.06, 0.0, 0.0]), 0.0 if forward else -90.0),
-            CameraMount("right", np.array([0.06, 0.0, 0.0]), 0.0 if forward else 90.0),
-        ]
+        if args.cam_layout == "down":
+            mounts = [CameraMount("left", np.zeros(3), 0.0, -90.0)]  # one camera under the drone ("left" is just its slot name); the top of the picture is the nose
+        else:
+            mounts = [
+                CameraMount("left", np.array([-0.06, 0.0, 0.0]), 0.0 if forward else -90.0),
+                CameraMount("right", np.array([0.06, 0.0, 0.0]), 0.0 if forward else 90.0),
+            ]
         self.cameras = {m.name: FisheyeCamera(ctx, self.renderer, m, (width, height), args.cam_face, args.cam_fov) for m in mounts}
-        self.camera_on = {"left": args.cams in ("both", "left"), "right": args.cams in ("both", "right")}
+        self.camera_on = {"left": args.cams in ("both", "left"), "right": args.cams in ("both", "right") and "right" in self.cameras}
         self.feed_times: dict[str, list[float]] = {"left": [], "right": []}
 
         self.link = None
         self.map_view = None
         if self.slam:
             from slam_view import SlamMapView
-            from slam_worker import CameraConfig, SlamLink
+            from slam_worker import CameraConfig, FixPolicy, MapPolicy, RigLink, SlamLink
             from vio import CameraModel, VioConfig, VisualInertialEstimator
 
             if width != height:
                 raise SystemExit("--slam needs square camera pictures (--cam-size NxN)")
-            models = [CameraModel(m.name, mount_rotation(m.yaw_degrees) @ GL_TO_CV, m.offset.copy()) for m in mounts]
+            models = [CameraModel(m.name, mount_rotation(m.yaw_degrees, m.pitch_degrees) @ GL_TO_CV, m.offset.copy()) for m in mounts]
+            filter_models = [CameraModel("rig", np.eye(3), np.zeros(3))] if self.rig_mode else models  # the rig SLAM reports the body's pose itself: one "camera" at the body centre
             vio = VioConfig(align=args.vio_align == "on", turn_rate=0.6 if args.vio_turn_trust == "on" else 1e9,
                             accel_bias_online=(args.accel == "online") if args.accel_bias == "auto" else args.accel_bias == "online", accel_gravity_gain=args.accel == "factory")
             if args.att_fusion == "old":
                 vio.attitude_gain, vio.attitude_gate_deg, vio.attitude_cap_deg, vio.attitude_bias_gain = 0.05, 4.0, 4.0, 0.0
-            estimator = VisualInertialEstimator(models, vio, use_baro=use_baro)
-            self.link = SlamLink([CameraConfig(m.name, width, args.slam_size, args.slam_fov, mm.body_from_cv, args.cam_fov, args.slam_fixes == "on", args.anchor_window, args.anchor_refresh == "on", args.scale_hint == "on") for m, mm in zip(mounts, models)])
+            estimator = VisualInertialEstimator(filter_models, vio, use_baro=use_baro)
+            fix_policy = FixPolicy(gain=args.fix_gain, guard=args.fix_guard == "on", prior_gate=args.fix_prior == "on", blame=args.fix_blame == "on", z_max=args.fix_zmax, z_blame=min(1.5, 0.5 * args.fix_zmax))
+            os.environ["RIG_OPTS"] = args.rig_opts  # the spawned worker inherits it
+            configs = [CameraConfig(m.name, width, args.slam_size, args.slam_fov, mm.body_from_cv, args.cam_fov, args.slam_fixes == "on", args.anchor_window, args.anchor_refresh == "on", args.scale_hint == "on", fix_policy, m.offset.copy(), map_policy(args) if args.map == "best" else None) for m, mm in zip(mounts, models)]
+            self.link = (RigLink if self.rig_mode else SlamLink)(configs)
             self.map_view = SlamMapView(ctx)
         else:
             estimator = StateEstimator()
@@ -225,6 +253,7 @@ class FpvApp:
             estimator.kp = args.att_kp
         self.estimator = estimator
         self.controller = FlightController(self.quad.params, self.quad.mixer_inverse, estimator)
+        self.controller.imu_filter.accel_cutoff, self.controller.imu_filter.gyro_cutoff = args.imu_filter
         self.controller.velocity_assist = args.assist and self.slam
         self.pilot = PilotInput()
         self.auto_pilot = PilotInput()
@@ -235,7 +264,7 @@ class FpvApp:
         self.yaw_unwrapped = 0.0
         self.last_sample: SensorSample | None = None
         self.banner = ("", -1e9)
-        self.recorder: Recorder | None = Recorder(args.record, (width, height), args.cam_fps, args.record_codec) if args.record else None
+        self.recorder: Recorder | None = Recorder(args.record, (width, height), args.cam_fps, args.record_codec, tuple(self.cameras)) if args.record else None
         self.diag = None
         if args.diag and self.slam:
             from diagnostics import FlightDiagnostics
@@ -305,7 +334,7 @@ class FpvApp:
         self.mission = "boot" if self.slam else "manual"
         self.mission_started = 0.0
         self.auto_pilot = PilotInput()
-        self.gyro_rows: dict[str, list] = {"left": [], "right": []}
+        self.gyro_rows: dict[str, list] = {n: [] for n in self.slam_names}
         self.truth_history: deque = deque(maxlen=500)  # (t, position in W, rotation in W) per IMU tick: what the oracle and the logs compare against
         self.last_mission = ""
         self.scale_ref: dict[str, float] = {}  # per camera: the filter's scale when it was first calibrated
@@ -352,8 +381,8 @@ class FpvApp:
         mounts = {}
         for name, camera in self.cameras.items():
             mount = camera.mount
-            mounts[name] = {"offset_body": mount.offset, "yaw_degrees": mount.yaw_degrees, "size": camera.size, "fisheye_fov_degrees": a.cam_fov,
-                            "body_from_cv": mount_rotation(mount.yaw_degrees) @ GL_TO_CV}
+            mounts[name] = {"offset_body": mount.offset, "yaw_degrees": mount.yaw_degrees, "pitch_degrees": mount.pitch_degrees, "size": camera.size, "fisheye_fov_degrees": a.cam_fov,
+                            "body_from_cv": mount_rotation(mount.yaw_degrees, mount.pitch_degrees) @ GL_TO_CV}
         return {
             "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()},
             "world_seed": self.world.seed, "start_position": self.start_position,
@@ -384,7 +413,7 @@ class FpvApp:
             self.view = "fpv" if self.view == "chase" else "chase"
         elif key == glfw.KEY_1:
             self.camera_on["left"] = not self.camera_on["left"]
-        elif key == glfw.KEY_2:
+        elif key == glfw.KEY_2 and "right" in self.cameras:
             self.camera_on["right"] = not self.camera_on["right"]
         elif key == glfw.KEY_M:
             self.args.low_mountains = not self.args.low_mountains
@@ -422,7 +451,8 @@ class FpvApp:
         a = self.args
         center = np.array([0.0, HOVER_HEIGHT, 0.0])
         waypoints = square(center, a.route_size, height_step=0.8)
-        self.route = Route(waypoints, self.estimator.position.copy(), now, a.route_speed, a.route_accel, a.route_dwell)
+        self.route = Route(waypoints, self.estimator.position.copy(), now, a.route_speed, a.route_accel, a.route_dwell, yaw_step=np.radians(a.route_yaw))
+        self.route_heading = attitude_angles(self.estimator.rotation)[2] if self.controller.heading_target is None else self.controller.heading_target
         self.mission = "route"
         self.controller.hold_target = None
         self.controller.velocity_assist = False
@@ -473,6 +503,8 @@ class FpvApp:
             pilot = self.auto_pilot if self.mission in AUTO_MISSIONS else self.pilot
             if self.mission == "route" and self.route is not None:
                 self.controller.reference = self.route.sample(sample.t)
+                if self.route.yaw_step:
+                    self.controller.heading_target = wrap_angle(self.route_heading + self.route.heading_offset)
             self.controller.update(sample, pilot, quad.on_ground)
             self.truth_history.append((sample.t, self.truth_in_w(), self.w_axes.T @ quad.rotation))
             if self.mission != self.last_mission:
@@ -516,7 +548,7 @@ class FpvApp:
                 right=WIGGLE_AMPLITUDE * ramp * np.sin(w * s + 1.2),
                 climb=0.2 * ramp * np.sin(0.7 * w * s),
             )
-            active = [n for n in self.cameras if self.camera_on[n]]
+            active = self.slam_names if self.rig_mode else [n for n in self.cameras if self.camera_on[n]]
             calibrated = self.args.imu_only or (active and all(est.scale_ready(n) for n in active))  # imu-only: there is no scale to learn
             if (s > WIGGLE_MIN_SECONDS and calibrated) or s > WIGGLE_MAX_SECONDS:
                 self.start_hold(np.array([0.0, HOVER_HEIGHT, 0.0]))
@@ -573,6 +605,7 @@ class FpvApp:
         rotation = quad.rotation
         wanted = bool(self.frame_callbacks) or self.recorder is not None
         slam_ready = self.link is not None and not self.args.imu_only and self.estimator.initialised and self.mission in ("wiggle", "hold", "route", "manual")  # the cameras start once airborne (after the IMU-only climb, which the accelerometer tracks to a few cm)
+        rig_pictures: dict[str, np.ndarray] = {}
         for name, camera in self.cameras.items():
             if not self.camera_on[name]:
                 continue
@@ -587,7 +620,12 @@ class FpvApp:
                 if self.recorder:
                     self.recorder.frame(name, frame, quad.time, quad.time - self.args.cam_time_offset)
                 if slam_ready:
-                    self._submit_slam(name, frame)
+                    if self.rig_mode:
+                        rig_pictures[name] = frame
+                    else:
+                        self._submit_slam(name, frame)
+        if rig_pictures:
+            self._submit_rig(rig_pictures)
 
     def _submit_slam(self, name: str, frame: np.ndarray) -> None:
         """Hand the SLAM what a real drone's computer has: the picture and the gyro since the last picture."""
@@ -606,9 +644,32 @@ class FpvApp:
         # with the current one a SLAM whose unit drifts drags its own yardstick along.
         if name not in self.scale_ref and est.scale_ready(name):
             self.scale_ref[name] = est.scale(name)
+            if self.args.scale_lock == "on":
+                est.lock_scale(name, self.scale_ref[name])
         calibrated = self.args.scale_ref == "calibrated" and name in self.scale_ref
-        hint = (est.x[0:3].copy(), self.scale_ref[name] if calibrated else est.scale(name), est.scale_ready(name))
+        hint = (est.x[0:3].copy(), self.scale_ref[name] if calibrated else est.scale(name), est.scale_ready(name), stamp)
         self.link.submit(name, stamp, frame, rows, est.gyro_bias.copy(), hint)
+
+    def _submit_rig(self, pictures: dict[str, np.ndarray]) -> None:
+        """Both cameras' pictures (taken at the same moment) go to the one rig SLAM, with the gyro since the last pair."""
+        est = self.estimator
+        name = "rig"
+        stamp = self.quad.time - self.args.cam_time_offset
+        buffer = self.gyro_rows[name]
+        if name not in self.link.started:
+            est.begin_camera(name)
+            self.scale_ref.pop(name, None)
+            buffer.clear()
+        cut = sum(1 for row in buffer if row[0] <= stamp)
+        rows = np.array(buffer[:cut]).reshape(-1, 4)
+        del buffer[:cut]
+        if name not in self.scale_ref and est.scale_ready(name):
+            self.scale_ref[name] = est.scale(name)
+            if self.args.scale_lock == "on":
+                est.lock_scale(name, self.scale_ref[name])
+        calibrated = self.args.scale_ref == "calibrated" and name in self.scale_ref
+        hint = (est.x[0:3].copy(), self.scale_ref[name] if calibrated else est.scale(name), est.scale_ready(name), stamp)
+        self.link.submit_rig(stamp, pictures, rows, est.gyro_bias.copy(), hint)
 
     def _sync_slam(self) -> None:
         """Feed finished SLAM poses to the estimator; wait if the SLAM lags more than --slam-latency behind the simulation."""
@@ -628,7 +689,7 @@ class FpvApp:
             if self.args.oracle != "off":
                 self.estimator.slam_pose(result.name, result.t, *self._oracle_pose(result))
             else:
-                self.estimator.slam_pose(result.name, result.t, result.rotation, result.position)
+                self.estimator.slam_pose(result.name, result.t, result.rotation, result.position, self.args.fix_sigma if result.telemetry.get("fix_now") else 0.0)
             if self.diag is not None:
                 self.diag.pose(self, result, before)
 
@@ -752,7 +813,7 @@ class FpvApp:
             self.overlay.upload("strip", self._draw_strip(width, strip_height, scale, layout))
             self.strip_at = now
         self.overlay.draw(self.overlay._textures["strip"], (0, 0, width, strip_height), size)
-        for name in ("left", "right"):
+        for name in self.cameras:
             if self.camera_on[name]:
                 cam = self.cameras[name]
                 tile = layout["tiles"][name]
@@ -777,6 +838,8 @@ class FpvApp:
         right_x0 = width - gap - tile
         left_x0 = right_x0 - gap - tile
         bottom = gap
+        if self.args.cam_layout == "down":  # one picture, in the right-hand slot
+            return {"gap": gap, "tile": tile, "panels_right": right_x0 - gap, "tiles": {"left": (right_x0, bottom, right_x0 + tile, bottom + tile)}}
         return {
             "gap": gap,
             "tile": tile,
@@ -815,7 +878,8 @@ class FpvApp:
                 cv2.putText(canvas, " ".join(f"{v:.0f}" for v in latest), (x0 + 4, bottom - int(4 * scale)), FONT, 0.3 * scale, (200, 200, 200), 1, cv2.LINE_AA)
             else:
                 draw_graph(canvas, box, title, history, limit, unit, scale, colors or AXIS_COLORS, labels)
-        for name, label in (("left", "LEFT CAM"), ("right", "RIGHT CAM")):
+        labels = {"left": "DOWN CAM"} if self.args.cam_layout == "down" else {"left": "LEFT CAM", "right": "RIGHT CAM"}
+        for name, label in labels.items():
             x0, y0, x1, y1 = layout["tiles"][name]
             cy0, cy1 = height - y1, height - y0
             cv2.rectangle(canvas, (x0, cy0), (x1, cy1), (0, 0, 0), -1)
@@ -870,7 +934,7 @@ class FpvApp:
             (("IMU-ONLY DEAD RECKONING" if self.args.imu_only else "SLAM MAP") + " (metres, drone's own estimate)    green: estimated path   magenta: true path   yellow +: hold point", (230, 230, 230)),
             (f"drift from the hold point (truth)  {np.linalg.norm(truth - target):.2f} m     estimate error {np.linalg.norm(est.position - truth):.2f} m     sim x{self.sim_rate:.2f}", (200, 255, 200)),
         ]
-        for name in self.cameras if not self.args.imu_only else ():
+        for name in self.slam_names if not self.args.imu_only else ():
             stats = self.link.stats.get(name)
             if stats is None:
                 lines.append((f"{name}: waiting for the first picture", (150, 150, 150)))
@@ -986,12 +1050,23 @@ class FpvApp:
         truth = self.truth_in_w()
         target = self.target_point()
         drift = truth - target
-        pair = lambda f: "/".join(f(n) for n in ("left", "right"))
+        pair = lambda f: "/".join(f(n) for n in self.slam_names)
         print(
             f"{self.quad.time:6.1f} {self.mission:8} {drift[0]:+8.2f} {drift[1]:+8.2f} {drift[2]:+8.2f} {np.linalg.norm(drift):8.2f} {np.linalg.norm(est.position - truth):9.2f}  "
             f"{pair(lambda n: f'{est.scale(n):.2f}({100 * est.scale_uncertainty(n):.0f}%)'):>20}  {pair(lambda n: str(est.updates[n])):>14}  "
             f"{pair(lambda n: str(self.link.stats.get(n, {}).get('tracks', '-'))):>10}  {pair(lambda n: str(self.link.stats.get(n, {}).get('steps', '-'))):>10}"
         )
+
+
+def map_policy(args):
+    """--map best, minus what --map-off switches off."""
+    from slam_worker import MapPolicy
+
+    off = set(filter(None, args.map_off.split(",")))
+    policy = MapPolicy(fuse="fuse" not in off, guided="guided" not in off, cull="cull" not in off, rigid_carry="rigid" not in off)
+    if "gate" in off:
+        policy.anchor_min_views, policy.anchor_min_angle_deg = 0, 0.0
+    return policy
 
 
 class Recorder:
@@ -1008,11 +1083,11 @@ class Recorder:
     meta.json              seed, command line, camera mounts and lens, the extrinsics, the sensor errors drawn for this run, how W relates to the world
     """
 
-    def __init__(self, folder: Path, size: tuple[int, int], fps: float, codec: str = "lossless") -> None:
+    def __init__(self, folder: Path, size: tuple[int, int], fps: float, codec: str = "lossless", names: tuple[str, ...] = ("left", "right")) -> None:
         folder.mkdir(parents=True, exist_ok=True)
         self.folder, self.size, self.fps = folder, size, fps
         extension, fourcc = ("mkv", "FFV1") if codec == "lossless" else ("mp4", "mp4v")
-        self.writers = {name: cv2.VideoWriter(str(folder / f"{name}.{extension}"), cv2.VideoWriter_fourcc(*fourcc), fps, size) for name in ("left", "right")}
+        self.writers = {name: cv2.VideoWriter(str(folder / f"{name}.{extension}"), cv2.VideoWriter_fourcc(*fourcc), fps, size) for name in names}
         for name, writer in self.writers.items():
             if not writer.isOpened():
                 raise SystemExit(f"--record: could not open {folder / f'{name}.{extension}'} for writing ({fourcc}); try --record-codec mp4")
@@ -1066,7 +1141,8 @@ class Recorder:
         position = est.position if est.position is not None else np.full(3, np.nan)
         velocity = est.velocity if est.velocity is not None else np.full(3, np.nan)
         bias = est.x[6:9] if have else np.full(3, np.nan)
-        scales = [est.scale(n) if have else float("nan") for n in ("left", "right")]
+        names = list(est.cameras)
+        scales = [est.scale(names[min(i, len(names) - 1)]) if have else float("nan") for i in range(2)]  # one scale per camera (the rig has just one: twice the same)
         self.csv["estimate"].writerow([f"{t:.4f}", mission, *map(f, position), *map(f, velocity), *map("{:.6f}".format, est.q), *map(f, truth_w), *map(f, target),
                                        *map(f, est.gyro_bias), *map(f, bias), *[f"{v:.4f}" for v in scales]])
 

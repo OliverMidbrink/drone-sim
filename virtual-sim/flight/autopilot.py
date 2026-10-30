@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from drone import GRAVITY, UP, QuadParams, attitude_angles, wrap_angle
-from sensors import SensorSample, StateEstimator
+from sensors import ImuFilter, SensorSample, StateEstimator
 
 
 class PID:
@@ -77,6 +77,7 @@ class FlightController:
         self.params = params
         self.mixer_inverse = mixer_inverse
         self.estimator = estimator or StateEstimator()
+        self.imu_filter = ImuFilter()  # accel 25 Hz, gyro 80 Hz; set a cutoff to 0 to bypass it
         self.limits = ControllerLimits()
         self.velocity_assist = False
         self.hold_target: np.ndarray | None = None  # world position (x, y, z) the position hold flies to
@@ -93,6 +94,7 @@ class FlightController:
     def reset(self, airborne: bool = False) -> None:
         """`airborne`: the drone starts in the air, so command hover thrust while the estimator calibrates."""
         self.estimator.reset()
+        self.imu_filter.reset()
         for pid in (*self.rate_pid, self.climb_pid, *self.velocity_pid):
             pid.reset()
         self.heading_target: float | None = None
@@ -104,6 +106,7 @@ class FlightController:
     def update(self, sample: SensorSample, pilot: PilotInput, on_ground: bool) -> np.ndarray:
         """One control tick: new sensor sample in, four motor thrust commands (N) out."""
         est, lim, p = self.estimator, self.limits, self.params
+        sample = self.imu_filter.apply(sample)  # the estimator and the rate loop work on the filtered IMU
         est.update(sample)
         dt = sample.dt
         if not est.initialised or dt <= 0.0:

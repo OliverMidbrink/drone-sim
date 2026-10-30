@@ -21,11 +21,15 @@ import numpy as np
 GL_TO_CV = np.diag([1.0, -1.0, -1.0])
 
 
-def mount_rotation(yaw_degrees: float) -> np.ndarray:
-    """GL-camera-to-body rotation for a camera looking `yaw_degrees` to the right of the drone's nose (negative = left)."""
-    yaw = np.radians(yaw_degrees)
-    forward = np.array([np.sin(yaw), 0.0, -np.cos(yaw)])
-    up = np.array([0.0, 1.0, 0.0])
+def mount_rotation(yaw_degrees: float, pitch_degrees: float = 0.0) -> np.ndarray:
+    """GL-camera-to-body rotation for a camera looking `yaw_degrees` to the right of the drone's nose (negative = left)
+    and `pitch_degrees` above the horizon (-90 = straight down; the top of a downward picture then points along the yaw direction)."""
+    yaw, pitch = np.radians(yaw_degrees), np.radians(pitch_degrees)
+    heading = np.array([np.sin(yaw), 0.0, -np.cos(yaw)])
+    forward = np.cos(pitch) * heading + np.array([0.0, np.sin(pitch), 0.0])
+    reference = np.array([0.0, 1.0, 0.0]) if abs(np.sin(pitch)) < 0.99 else heading  # "up" in the picture
+    up = reference - (reference @ forward) * forward
+    up /= np.linalg.norm(up)
     right = np.cross(forward, up)
     return np.stack([right, up, -forward], axis=1)  # columns: camera x, y, z in body coordinates
 

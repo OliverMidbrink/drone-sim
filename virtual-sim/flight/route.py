@@ -41,8 +41,10 @@ def leg_duration(distance: float, speed: float, accel: float) -> float:
 class Route:
     """Fly from `start` to waypoint 0, then round all the waypoints again and again (or once, with loop=False)."""
 
-    def __init__(self, waypoints: np.ndarray, start: np.ndarray, t0: float, speed: float, accel: float, dwell: float = 1.0, loop: bool = True) -> None:
+    def __init__(self, waypoints: np.ndarray, start: np.ndarray, t0: float, speed: float, accel: float, dwell: float = 1.0, loop: bool = True, yaw_step: float = 0.0) -> None:
         self.waypoints = np.asarray(waypoints, dtype=float)
+        self.yaw_step = yaw_step  # radians the heading turns during the dwell at every waypoint of the lap (0 = the heading is held)
+        self.heading_offset = 0.0  # radians turned so far
         self.t0, self.loop = t0, loop
         n = len(self.waypoints)
         self.lead = [self._leg(np.asarray(start, float), self.waypoints[0], 0, speed, accel, dwell)]
@@ -66,12 +68,14 @@ class Route:
         """Where the drone should be at time t, how fast it should move and accelerate (world frame)."""
         s = max(t - self.t0, 0.0)
         legs = self.lead
+        done = 0  # dwells of the lap finished before the current leg (the lead leg's counts as none: the turns start at waypoint 0)
         if s >= self.lead_time:
             s -= self.lead_time
             if self.cycle_time <= 0.0:
                 legs, s = [], 0.0
             elif self.loop:
                 self.laps = int(s // self.cycle_time)
+                done = self.laps * len(self.cycle)
                 s = s % self.cycle_time
                 legs = self.cycle
             elif s >= self.cycle_time:
@@ -86,7 +90,12 @@ class Route:
             if s < leg.total:
                 break
             s -= leg.total
+            done += 1 if legs is self.cycle else 0
         self.leg = leg
+        turning = legs is self.cycle and s >= leg.duration
+        ramp = (s - leg.duration) / max(leg.dwell, 1e-6) if turning else 0.0
+        ramp = min(ramp, 1.0)
+        self.heading_offset = self.yaw_step * (done + (3.0 * ramp**2 - 2.0 * ramp**3))  # smooth turn over the dwell
         if s >= leg.duration:
             self.moving = False
             return leg.end.copy(), zero, zero

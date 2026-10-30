@@ -86,13 +86,14 @@ class CameraMount:
     name: str
     offset: np.ndarray  # body-frame position of the lens
     yaw_degrees: float  # where it looks: -90 left, +90 right, 0 forward
+    pitch_degrees: float = 0.0  # -90: straight down
 
 
 class FisheyeCamera:
     def __init__(self, ctx: moderngl.Context, renderer: Renderer, mount: CameraMount, size: tuple[int, int] = (1080, 1080), face_size: int = 1024, lens_fov: float = LENS_FOV) -> None:
         self.ctx, self.renderer, self.mount, self.size = ctx, renderer, mount, size
         self.lens_fov = lens_fov
-        self.rotation = mount_rotation(mount.yaw_degrees)
+        self.rotation = mount_rotation(mount.yaw_degrees, mount.pitch_degrees)
         self.faces = []
         self.face_buffers = []
         depth = ctx.depth_renderbuffer((face_size, face_size))

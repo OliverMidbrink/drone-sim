@@ -109,6 +109,9 @@ class RawSlam:
         self.birth: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         # track id -> [sum of weight * position (3), sum of weights]: the landmark is their ratio
         self.landmarks: dict[int, np.ndarray] = {}
+        self.landmark_views: dict[int, int] = {}  # track id -> how many steps triangulated it
+        self.landmark_angle: dict[int, float] = {}  # track id -> the widest triangulation angle it has had (deg)
+        self.carry_scale = True  # a fix rescales the live map to the anchors' depths (False: rotation and translation only)
         self.orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         self.anchor_descriptors = np.empty((0, 32), np.uint8)
@@ -154,10 +157,13 @@ class RawSlam:
             self.birth.setdefault(int(track), (pixel.astype(np.float64), *pose))
         self.birth = {i: v for i, v in self.birth.items() if i in alive}
         self.landmarks = {i: v for i, v in self.landmarks.items() if i in alive}
+        self.landmark_views = {i: v for i, v in self.landmark_views.items() if i in self.landmarks}
+        self.landmark_angle = {i: v for i, v in self.landmark_angle.items() if i in self.landmarks}
 
     def process(self, frame: np.ndarray) -> bool:
         """Advance by one BGR frame. True when the pose changed (a step and/or an anchor fix)."""
         self.frame_number += 1
+        self.telemetry["fix_now"] = 0.0
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         height, width = gray.shape
         if len(self.track_points) >= 1:
@@ -315,9 +321,12 @@ class RawSlam:
             self.telemetry.update(tri_valid=float(valid.mean()), tri_angle_med=float(np.median(angle_deg[valid])), tri_top_share=float(ordered[-max(1, len(ordered) // 10):].sum() / max(ordered.sum(), 1e-12)))
         midpoint = 0.5 * (point_first + point_second)
         for index in np.flatnonzero(valid):
-            entry = self.landmarks.setdefault(int(ids[rows[index]]), np.zeros(4))
+            track = int(ids[rows[index]])
+            entry = self.landmarks.setdefault(track, np.zeros(4))
             entry[:3] += weight[index] * midpoint[index]
             entry[3] += weight[index]
+            self.landmark_views[track] = self.landmark_views.get(track, 0) + 1
+            self.landmark_angle[track] = max(self.landmark_angle.get(track, 0.0), float(angle_deg[index]))
         # a landmark whose weights summed to nothing has no position yet
         for track in [t for t, v in self.landmarks.items() if v[3] <= 0.0]:
             del self.landmarks[track]
@@ -341,7 +350,7 @@ class RawSlam:
         have = [(k, self.anchor_row[t]) for k, t in enumerate(ids) if t in self.anchor_row]
         if have and self.refresh_anchors:
             self.anchor_points[[row for _, row in have]] = positions[[k for k, _ in have]]
-        fresh = [k for k, t in enumerate(ids) if t not in self.anchor_row]
+        fresh = [k for k, t in enumerate(ids) if t not in self.anchor_row and self._anchor_ready(t)]
         if not fresh or not self.make_anchors:
             return
         keypoint_xy = np.array([k.pt for k in keypoints], dtype=np.float32)
@@ -357,6 +366,8 @@ class RawSlam:
             taken.add(keypoint)
             rows.append(keypoint)
             chosen.append(fresh[column])
+        if rows:
+            rows, chosen = self._fuse_anchors(keypoints, descriptors, rows, chosen, ids, positions)
         if not rows:
             return
         first_row = len(self.anchor_points)
@@ -366,38 +377,75 @@ class RawSlam:
         for offset, k in enumerate(chosen):
             self.anchor_row[ids[k]] = first_row + offset
 
-    def _localize(self, keypoints: list, descriptors: np.ndarray) -> None:
-        """Match the whole frame against every old anchor (no pose prior) and snap the pose with PnP."""
-        old = np.flatnonzero(self.anchor_step <= self.commits - MIN_ANCHOR_AGE)
-        if len(old) < MIN_PNP_INLIERS:
-            return
+    def _anchor_ready(self, track: int) -> bool:
+        """Hook: may this tracked landmark become an anchor now? The raw engine anchors every landmark as soon as it has a position."""
+        return True
+
+    def _fuse_anchors(self, keypoints: list, descriptors: np.ndarray, rows: list, chosen: list, ids: list, positions: np.ndarray) -> tuple[list, list]:
+        """Hook: of the new anchors about to be made (keypoint rows, indices into ids/positions), which are really new. The raw engine makes them all."""
+        return rows, chosen
+
+    def _match_anchors(self, keypoints: list, descriptors: np.ndarray, old: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+        """Hook: (picture points, anchor rows, number of matches) for a fix. The raw engine matches the whole frame against every old anchor."""
         pairs = self.matcher.knnMatch(descriptors, self.anchor_descriptors[old], k=2)
         good = [p[0] for p in pairs if len(p) == 2 and p[0].distance <= MAX_HAMMING and p[0].distance < MATCH_RATIO * p[1].distance]
-        if len(good) < MIN_PNP_INLIERS:
-            return
-        image = np.array([keypoints[m.queryIdx].pt for m in good], dtype=np.float64)
-        world = self.anchor_points[old[[m.trainIdx for m in good]]]
+        image = np.array([keypoints[m.queryIdx].pt for m in good], dtype=np.float64).reshape(-1, 2)
+        return image, old[[m.trainIdx for m in good]], len(good)
+
+    def _localize(self, keypoints: list, descriptors: np.ndarray) -> None:
+        """Match the whole frame against every old anchor (no pose prior) and snap the pose with PnP."""
+        fix = self._solve_fix(keypoints, descriptors)
+        if fix is not None:
+            self._apply_fix(fix)
+
+    def _filter_matches(self, image: np.ndarray, world: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        """Hook: which of the matched anchors (picture point, anchor position, anchor row) may take part in the fit. The raw engine keeps all."""
+        return np.ones(len(rows), bool)
+
+    def _solve_fix(self, keypoints: list, descriptors: np.ndarray) -> dict | None:
+        """The pose the old anchors put the camera at, or None. Returns the pose and the anchors it was built from, nothing is applied yet."""
+        old = np.flatnonzero(self.anchor_step <= self.commits - MIN_ANCHOR_AGE)
+        old = old[self._anchor_usable(old)]
+        if len(old) < MIN_PNP_INLIERS:
+            return None
+        image, rows, matches = self._match_anchors(keypoints, descriptors, old)
+        if matches < MIN_PNP_INLIERS:
+            return None
+        world = self.anchor_points[rows]
+        keep = self._filter_matches(image, world, rows)
+        image, world, rows = image[keep], world[keep], rows[keep]
+        if len(rows) < MIN_PNP_INLIERS:
+            return None
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(
             world, image, self.intrinsic, None,
             iterationsCount=PNP_ITERATIONS, reprojectionError=PNP_PX, flags=cv2.SOLVEPNP_AP3P,
         )
         if not ok or inliers is None or len(inliers) < MIN_PNP_INLIERS:
-            return
+            return None
         inliers = inliers.ravel()
         rvec, tvec = cv2.solvePnPRefineLM(world[inliers], image[inliers], self.intrinsic, None, rvec, tvec)
         rotation_world_to_camera = cv2.Rodrigues(rvec)[0]
-        new_rotation = rotation_world_to_camera.T
-        new_position = (-rotation_world_to_camera.T @ tvec).ravel()
-        rows_used = old[[m.trainIdx for m in good]][inliers]
+        return dict(
+            rotation=rotation_world_to_camera.T, position=(-rotation_world_to_camera.T @ tvec).ravel(),
+            image=image[inliers], world=world[inliers], rows=rows[inliers], matches=matches, candidates=len(old), matched_rows=rows,
+        )
+
+    def _anchor_usable(self, rows: np.ndarray) -> np.ndarray:
+        """Hook: which anchors (rows) may be matched at all. The raw engine uses every one."""
+        return np.ones(len(rows), bool)
+
+    def _apply_fix(self, fix: dict) -> None:
+        new_rotation, new_position = fix["rotation"], fix["position"]
+        rows_used = fix["rows"]
         alive_rows = {self.anchor_row[int(t)] for t in self.track_ids if int(t) in self.anchor_row}
         age = self.commits - self.anchor_step[rows_used]
         self.telemetry.update(
-            fix_matches=float(len(good)), fix_inliers=float(len(inliers)), fix_candidates=float(len(old)), fix_age_med=float(np.median(age)), fix_age_min=float(age.min()), fix_age_max=float(age.max()),
+            fix_matches=float(fix["matches"]), fix_inliers=float(len(rows_used)), fix_candidates=float(fix["candidates"]), fix_age_med=float(np.median(age)), fix_age_min=float(age.min()), fix_age_max=float(age.max()),
             fix_live=float(np.mean([r in alive_rows for r in rows_used])),
             fix_rot_deg=float(np.degrees(np.arccos(np.clip((np.trace(new_rotation.T @ self.world_rotation) - 1.0) / 2.0, -1.0, 1.0)))),
-            fix_move=float(np.linalg.norm(new_position - self.world_position)),
+            fix_move=float(np.linalg.norm(new_position - self.world_position)), fix_now=1.0,
         )
-        self._carry_live_map(new_rotation, new_position, image[inliers], world[inliers])
+        self._carry_live_map(new_rotation, new_position, fix["image"], fix["world"])
         self.world_rotation, self.world_position = new_rotation, new_position
         self.fixes += 1
 
@@ -430,6 +478,8 @@ class RawSlam:
                 scale = float(np.median(depth_anchor[usable] / depth_live[usable]))
             self.telemetry.update(fix_pairs=float(usable.sum()))
         self.telemetry.update(fix_scale=scale)
+        if not self.carry_scale:
+            scale = 1.0
 
         def carry(point: np.ndarray) -> np.ndarray:
             return new_position + scale * (relative @ (point - old_position))
