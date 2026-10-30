@@ -57,6 +57,7 @@ import glfw
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import paths  # noqa: E402,F401  (puts flight/, slam/, viewer/ on the path)
 
 from autopilot import FlightController, PilotInput  # noqa: E402
 from camera import Camera  # noqa: E402

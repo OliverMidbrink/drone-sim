@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "3D-SLAM"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "3D-SLAM"))
 
 from raw_slam import RawSlam  # noqa: E402
 

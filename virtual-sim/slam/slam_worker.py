@@ -54,9 +54,9 @@ def _expm(v: np.ndarray) -> np.ndarray:
 
 
 def worker_main(config: CameraConfig, shm_name: str, inbox, outbox) -> None:
-    here = Path(__file__).resolve().parent
-    sys.path.insert(0, str(here))
-    sys.path.insert(0, str(here.parent / "3D-SLAM"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import paths  # noqa: F401  (flight/, slam/, viewer/ and 3D-SLAM/ on the path)
+
     import cv2
 
     from imu_slam import ImuAidedSlam

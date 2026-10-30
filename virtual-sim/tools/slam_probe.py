@@ -18,7 +18,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "3D-SLAM"))
+import paths  # noqa: E402,F401
 
 from lens import GL_TO_CV, pinhole_matrix, rectify_maps  # noqa: E402
 from imu_slam import ImuAidedSlam, rotation_vector_to_matrix  # noqa: E402

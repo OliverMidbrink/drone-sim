@@ -1,5 +1,6 @@
 import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
+import paths  # noqa: F401
 import time
 import numpy as np
 from terrain import Terrain
