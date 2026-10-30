@@ -11,6 +11,7 @@ Walking (click the window to capture the mouse, Esc to let go, Esc again to quit
     V              camera: walk / follow the robot / ride on the robot
     X              ceiling on / off (off for a view from above: jump onto a desk and look down)
     H              HUD on / off
+    B              show the collision boxes instead of the models (what you bump into and can stand on)
 
 The robot (arrow keys work in every camera mode; W A S D too while following or riding):
     Up / Down      drive forward / back          Left / Right   turn
@@ -35,8 +36,9 @@ import paths  # noqa: E402,F401
 
 from camera import Camera  # noqa: E402
 from hud import FONT, History, Overlay, draw_graph  # noqa: E402
+from office import geometry  # noqa: E402
 from office.layout import SPAWN, OfficeLayout  # noqa: E402
-from office.renderer import OfficeRenderer  # noqa: E402
+from office.renderer import MeshBuilder, OfficeRenderer  # noqa: E402
 from office.walker import Walker  # noqa: E402
 from render import OffscreenTarget, create_hidden_context  # noqa: E402
 from robot.firmware import Command  # noqa: E402
@@ -76,6 +78,8 @@ class Scene:
         self.renderer.set_static(self.layout.building, "building")
         self.renderer.set_static(self.layout.ceiling, "ceiling")
         self.renderer.set_lights(self.layout.lights)
+        self.renderer.hidden_layers.add("collision")
+        self.collision_built = False
         self.walker = Walker(self.layout.boxes, 1.2, SPAWN[1], np.pi / 2.0)  # camera yaw 90 degrees looks along +x
         self.robot: RobotSim | None = None
         if robot:
@@ -84,6 +88,27 @@ class Scene:
         self.mode = "walk"
         self.chase_offset = np.array([0.0, np.radians(-14.0)])  # yaw relative to the robot's heading, pitch
         self.chase_heading = SPAWN[2]
+
+    def toggle_collision_view(self) -> None:
+        """Swap the models for solid blocks of the collision boxes, tinted by height."""
+        if not self.collision_built:
+            builder = MeshBuilder()
+            for b in self.layout.boxes:
+                top = 0.12 if b.height >= 2.9 and b.y_min == 0.0 else b.height  # walls only as a low strip, so the rooms can be seen
+                size = (b.x_max - b.x_min, top - b.y_min, b.z_max - b.z_min)
+                centre = ((b.x_min + b.x_max) / 2, (top + b.y_min) / 2, (b.z_min + b.z_max) / 2)
+                shade = min(top / 1.8, 1.0)  # low things red, tall things blue
+                builder.add(geometry.box(centre, size, (0.45 - 0.3 * shade, 0.12 + 0.12 * shade, 0.05 + 0.4 * shade, 1.0)), np.eye(4))
+            self.renderer.set_static(builder, "collision")
+            self.collision_built = True
+        hidden = self.renderer.hidden_layers
+        showing = "collision" not in hidden
+        if showing:
+            hidden.update({"collision"})
+            hidden.difference_update({"building"})
+        else:
+            hidden.difference_update({"collision"})
+            hidden.update({"building", "ceiling"})
 
     # --- the robot ---------------------------------------------------------------------------
 
@@ -141,7 +166,7 @@ class Scene:
             p = origin + direction * d
             if p[1] < 0.05 or p[1] > 2.9:
                 return max(d - 0.12, 0.15)
-            inside = (bounds[:, 0] < p[0]) & (p[0] < bounds[:, 2]) & (bounds[:, 1] < p[2]) & (p[2] < bounds[:, 3]) & (bounds[:, 4] > p[1])
+            inside = (bounds[:, 0] < p[0]) & (p[0] < bounds[:, 2]) & (bounds[:, 1] < p[2]) & (p[2] < bounds[:, 3]) & (bounds[:, 4] < p[1]) & (bounds[:, 5] > p[1])
             if inside.any():
                 return max(d - 0.12, 0.15)
         return wanted
@@ -212,6 +237,8 @@ class Playground:
         elif key == glfw.KEY_X:
             hidden = scene.renderer.hidden_layers
             hidden.symmetric_difference_update({"ceiling"})
+        elif key == glfw.KEY_B:
+            scene.toggle_collision_view()
         elif key == glfw.KEY_H:
             self.hud = not self.hud
         elif scene.robot:
@@ -328,6 +355,8 @@ def screenshot(args: argparse.Namespace) -> None:
         scene.walker.yaw, scene.walker.pitch = np.radians(yaw), np.radians(pitch)
     if scene.robot:
         scene.robot.advance(args.settle)
+    if args.collision:
+        scene.toggle_collision_view()
     if args.no_ceiling:
         scene.renderer.hidden_layers.add("ceiling")
     target = OffscreenTarget(ctx, (args.width, args.height))
@@ -350,6 +379,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=MODES, default="walk", help="camera for --screenshot")
     parser.add_argument("--pose", type=float, nargs=5, metavar=("X", "EYE_Y", "Z", "YAW_DEG", "PITCH_DEG"), help="walking camera for --screenshot")
     parser.add_argument("--settle", type=float, default=3.0, help="seconds the robot balances before a --screenshot")
+    parser.add_argument("--collision", action="store_true", help="show the collision boxes in a --screenshot")
     parser.add_argument("--no-ceiling", action="store_true", help="hide the ceiling in a --screenshot")
     return parser.parse_args()
 

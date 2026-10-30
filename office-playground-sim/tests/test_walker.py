@@ -74,6 +74,40 @@ def test_cannot_leave_the_office_or_pass_through_furniture():
                 assert not inside
 
 
+def test_mesh_boxes_follow_the_shape_of_a_model():
+    from office import geometry
+    from office.collision import ShapeCache, mesh_boxes
+
+    white = (1.0, 1.0, 1.0)
+    table = [geometry.box((0, 0.725, 0), (1.0, 0.05, 0.6), white)] + [geometry.box((sx * 0.45, 0.35, sz * 0.25), (0.05, 0.7, 0.05), white) for sx in (-1, 1) for sz in (-1, 1)]
+    boxes = mesh_boxes(ShapeCache().get("table", table), np.eye(4))
+    top = max(b[5] for b in boxes)
+    assert 0.7 < top <= 0.8 + 1e-9  # within a cell of the real 0.75
+    slab = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+    assert slab[4] > 0.6  # the biggest piece is the top, with air under it
+    assert sum(1 for b in boxes if b[4] == 0.0) == 4  # four legs on the floor
+    under = [b for b in boxes if b[4] == 0.0 and abs((b[0] + b[2]) / 2) < 0.3]
+    assert not under  # nothing in the middle below the top
+    rotated = np.eye(4)
+    rotated[:3, :3] = [[0, 0, 1], [0, 1, 0], [-1, 0, 0]]  # a quarter turn
+    turned = mesh_boxes(ShapeCache().get("table", table), rotated)
+    assert max(b[3] for b in turned) - min(b[1] for b in turned) > 0.9 and max(b[2] for b in turned) - min(b[0] for b in turned) < 0.75
+
+
+def test_walking_through_the_legs_of_a_chair_but_not_through_its_back():
+    layout = OfficeLayout(0)
+    chairs = [b for b in layout.boxes if 0.3 < b.y_min < 0.6]  # seats: air below them
+    assert chairs
+    seat = chairs[0]
+    walker = Walker(layout.boxes, (seat.x_min + seat.x_max) / 2, (seat.z_min + seat.z_max) / 2)
+    run(walker, 0.5)
+    assert walker.position is not None
+    # the box of a seat blocks a person at body height
+    blocker = Walker([seat], seat.x_min - 0.5, (seat.z_min + seat.z_max) / 2)
+    run(blocker, 1.0, FORWARD_X)
+    assert blocker.position[0] <= seat.x_min - Walker.RADIUS + 1e-6
+
+
 if __name__ == "__main__":
     for name, function in list(globals().items()):
         if name.startswith("test_"):

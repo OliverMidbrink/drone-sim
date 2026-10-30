@@ -101,7 +101,7 @@ class RobotSim:
         self.encoders = Encoders(self.plant)
         self.firmware = BalanceFirmware(self.nominal)
         self.obstacles = obstacles or []
-        self._bounds = np.array([[b.x_min, b.z_min, b.x_max, b.z_max] for b in self.obstacles], float).reshape(-1, 4)
+        self._bounds = np.array([[b.x_min, b.z_min, b.x_max, b.z_max, getattr(b, "y_min", 0.0), b.height] for b in self.obstacles], float).reshape(-1, 6)
         self._near: list = []
         self.command = Command()
         self.duty = np.zeros(2)  # being applied
@@ -190,7 +190,8 @@ class RobotSim:
             return
         x, z, reach = self.plant.x, self.plant.z, 0.45
         b = self._bounds
-        keep = np.nonzero((b[:, 0] - reach < x) & (x < b[:, 2] + reach) & (b[:, 1] - reach < z) & (z < b[:, 3] + reach))[0]
+        tall = self.params.com_height + 0.5 * self.params.body_size[2] + 0.02  # a box only matters if it is in the way of the wheels or the body
+        keep = np.nonzero((b[:, 0] - reach < x) & (x < b[:, 2] + reach) & (b[:, 1] - reach < z) & (z < b[:, 3] + reach) & (b[:, 4] < tall) & (b[:, 5] > 0.04))[0]
         self._near = [self.obstacles[i] for i in keep]
 
     def _record(self) -> None:

@@ -1,8 +1,9 @@
 """A person walking about the office: gravity, jumping, walls and furniture that stop you, desks you can jump onto.
 
 The walker is a vertical capsule seen from above as a circle. The furniture and walls come as
-axis-aligned boxes (`layout.Box`, with an absolute top height). A box lower than a step above the
-feet is something to stand on; a taller one is a wall.
+axis-aligned boxes (`layout.Box`, with an underside and a top height). A box whose top is lower than a
+step above the feet is something to stand on; one that reaches into the body (above the step, below the
+head) is a wall; one overhead does not matter.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ class Walker:
     CEILING = 3.0
 
     def __init__(self, boxes, x: float = 0.0, z: float = 0.0, yaw: float = 0.0) -> None:
-        self.bounds = np.array([[b.x_min, b.z_min, b.x_max, b.z_max, b.height] for b in boxes], float).reshape(-1, 5)
+        self.bounds = np.array([[b.x_min, b.z_min, b.x_max, b.z_max, getattr(b, "y_min", 0.0), b.height] for b in boxes], float).reshape(-1, 6)
         self.position = np.array([x, z], float)
         self.feet = 0.0
         self.velocity = np.zeros(2)
@@ -67,9 +68,9 @@ class Walker:
 
         self.position = self.position + self.velocity * dt
         near = self._near(self.RADIUS + 0.1)
-        for x0, z0, x1, z1, top in near:
-            if top <= self.feet + self.STEP:
-                continue  # low enough to step onto
+        for x0, z0, x1, z1, bottom, top in near:
+            if top <= self.feet + self.STEP or bottom >= self.feet + self.HEAD:
+                continue  # low enough to step onto, or over our head
             closest = np.clip(self.position, (x0, z0), (x1, z1))
             offset = self.position - closest
             distance = float(np.hypot(*offset))
@@ -89,7 +90,7 @@ class Walker:
 
         # vertical: stand on the floor or on whatever is low enough under the circle
         support = 0.0
-        for x0, z0, x1, z1, top in self._near(self.RADIUS):
+        for x0, z0, x1, z1, _bottom, top in self._near(self.RADIUS):
             if top > support and top <= self.feet + self.STEP:
                 closest = np.clip(self.position, (x0, z0), (x1, z1))
                 if np.hypot(*(self.position - closest)) < self.RADIUS:

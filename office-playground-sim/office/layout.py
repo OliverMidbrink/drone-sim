@@ -31,6 +31,7 @@ import numpy as np
 
 from . import geometry
 from .assets import Asset, AssetLibrary
+from .collision import ShapeCache, mesh_boxes
 from .renderer import Light, MeshBuilder
 
 CELL = 3.0
@@ -48,7 +49,8 @@ class Box:
     z_min: float
     x_max: float
     z_max: float
-    height: float = 2.5
+    height: float = 2.5  # the top, as a height above the floor
+    y_min: float = 0.0  # the underside (above 0 for a seat or a shelf with air below it)
 
 
 @dataclass
@@ -95,6 +97,7 @@ class Placer:
         self.builder = builder
         self.boxes: list[Box] = []
         self.count = 0
+        self.shapes = ShapeCache(library.root / "collision_shapes.npz")
 
     def put(
         self,
@@ -123,8 +126,15 @@ class Placer:
             self.builder.add(primitive, matrix, tint)
         self.count += 1
         if solid:
-            self.boxes.append(self.footprint(asset, matrix))
+            self.boxes += self.shape_boxes(asset, matrix)
         return asset
+
+    def shape_boxes(self, asset: Asset, matrix: np.ndarray) -> list[Box]:
+        """Boxes that follow the model's mesh (see office.collision); the plain footprint box if it has no triangles."""
+        found = mesh_boxes(self.shapes.get(asset.name, asset.primitives), matrix)
+        if not found:
+            return [self.footprint(asset, matrix)]
+        return [Box(x0, z0, x1, z1, y1, y0) for x0, z0, x1, z1, y0, y1 in found]
 
     @staticmethod
     def footprint(asset: Asset, matrix: np.ndarray) -> Box:
@@ -160,6 +170,7 @@ class OfficeLayout:
         self._lounge()
         self._corridor()
         self.boxes += self.placer.boxes
+        self.placer.shapes.save()
         self.items = self.placer.count
 
     # --- shell ---------------------------------------------------------------------------------
