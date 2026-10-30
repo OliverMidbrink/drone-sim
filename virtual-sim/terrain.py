@@ -158,13 +158,51 @@ class Terrain:
         gx, gz = self._grid(x, z)
         return self.normals[np.round(gz).astype(int), np.round(gx).astype(int), 1]
 
-    def mesh(self) -> tuple[np.ndarray, np.ndarray]:
-        """(vertices (N, 6) float32 = position + normal, triangle indices uint32)."""
+    def normal_at(self, x: float, z: float) -> np.ndarray:
+        """Surface normal of the grid cell nearest to world (x, z)."""
+        gx, gz = self._grid(x, z)
+        return self.normals[int(round(float(gz))), int(round(float(gx)))]
+
+    def tiled_mesh(self, tile: int = 50) -> "TerrainMesh":
+        """The terrain as one vertex buffer and an index buffer ordered tile by tile, so tiles can be culled and drawn separately."""
         resolution = self.resolution
         axis = np.linspace(-self.half, self.half, resolution, dtype=np.float32)
         x, z = np.meshgrid(axis, axis)
         vertices = np.concatenate([np.stack([x, self.heights, z], axis=-1), self.normals], axis=-1).reshape(-1, 6)
         index = np.arange(resolution * resolution, dtype=np.uint32).reshape(resolution, resolution)
         a, b, c, d = index[:-1, :-1], index[:-1, 1:], index[1:, :-1], index[1:, 1:]
-        indices = np.stack([a, c, b, b, c, d], axis=-1).reshape(-1)
-        return np.ascontiguousarray(vertices, dtype=np.float32), indices
+        quads = np.stack([a, c, b, b, c, d], axis=-1)  # (rows, columns, 6)
+        edges = list(range(0, resolution - 1, tile)) + [resolution - 1]
+        spacing = self.size / (resolution - 1)
+        blocks, firsts, centres, radii = [], [], [], []
+        offset = 0
+        for r0, r1 in zip(edges[:-1], edges[1:]):
+            for c0, c1 in zip(edges[:-1], edges[1:]):
+                block = quads[r0:r1, c0:c1].reshape(-1)
+                patch = self.heights[r0 : r1 + 1, c0 : c1 + 1]
+                low = np.array([c0 * spacing - self.half, patch.min(), r0 * spacing - self.half])
+                high = np.array([c1 * spacing - self.half, patch.max(), r1 * spacing - self.half])
+                blocks.append(block)
+                firsts.append(offset)
+                centres.append((low + high) / 2.0)
+                radii.append(np.linalg.norm(high - low) / 2.0)
+                offset += block.size
+        firsts.append(offset)
+        return TerrainMesh(
+            np.ascontiguousarray(vertices, dtype=np.float32),
+            np.concatenate(blocks),
+            np.array(firsts[:-1]),
+            np.array(firsts[1:]),
+            np.array(centres),
+            np.array(radii),
+        )
+
+
+@dataclass
+class TerrainMesh:
+    vertices: np.ndarray  # (N, 6) float32: position + normal
+    indices: np.ndarray  # uint32 triangles, grouped by tile
+    starts: np.ndarray  # per tile, first index
+    ends: np.ndarray  # per tile, one past the last index
+    centres: np.ndarray  # per tile bounding sphere
+    radii: np.ndarray

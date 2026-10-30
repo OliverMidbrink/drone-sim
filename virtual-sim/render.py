@@ -7,6 +7,7 @@ are needed for the ground: its colours come from height, slope and a small tilin
 
 from __future__ import annotations
 
+import cv2
 import moderngl
 import numpy as np
 
@@ -230,7 +231,7 @@ class OffscreenTarget:
         width, height = self.size
         self.ctx.copy_framebuffer(self._resolved, self.framebuffer)
         rgb = np.frombuffer(self._resolved.read(components=3), dtype=np.uint8).reshape(height, width, 3)
-        return np.ascontiguousarray(rgb[::-1, :, ::-1])
+        return cv2.cvtColor(cv2.flip(rgb, 0), cv2.COLOR_RGB2BGR)
 
 
 class _TreeBatch:
@@ -337,14 +338,15 @@ class Renderer:
         self._textures: dict[int, moderngl.Texture] = {}
         self.batches = [_TreeBatch(ctx, self.tree_program, tree, self._textures) for tree in models]
         self.last_tree_count = 0
+        self.tiles = None
 
     def set_terrain(self, terrain: Terrain) -> None:
         if self.terrain_vao is not None:
             self.terrain_vao.release()
             for buffer in self._terrain_buffers:
                 buffer.release()
-        vertices, indices = terrain.mesh()
-        vertex_buffer, index_buffer = self.ctx.buffer(vertices.tobytes()), self.ctx.buffer(indices.tobytes())
+        self.tiles = terrain.tiled_mesh()
+        vertex_buffer, index_buffer = self.ctx.buffer(self.tiles.vertices.tobytes()), self.ctx.buffer(self.tiles.indices.tobytes())
         self._terrain_buffers = [vertex_buffer, index_buffer]
         self.terrain_vao = self.ctx.vertex_array(self.ground, [(vertex_buffer, "3f 3f", "in_position", "in_normal")], index_buffer=index_buffer, index_element_size=4)
 
@@ -352,12 +354,13 @@ class Renderer:
         for batch, data in zip(self.batches, instances):
             batch.set_instances(data)
 
-    def draw(self, target: moderngl.Framebuffer, size: tuple[int, int], camera: Camera) -> None:
-        """Render the camera's view into `target` (a framebuffer of `size` = (width, height) pixels)."""
+    def draw(self, target: moderngl.Framebuffer, size: tuple[int, int], camera: Camera, origin: tuple[int, int] = (0, 0)) -> None:
+        """Render the camera's view into `target`, into the `size` = (width, height) pixel rectangle whose bottom-left corner is `origin`."""
         width, height = size
         target.use()
-        target.viewport = (0, 0, width, height)
-        target.clear(depth=1.0)
+        target.viewport = (*origin, width, height)
+        self.ctx.scissor = (*origin, width, height)
+        target.clear(depth=1.0, viewport=(*origin, width, height))
         view_projection = camera.projection_matrix(width / height, NEAR, FAR) @ camera.view_matrix()
         position = tuple(float(v) for v in camera.position)
         for program in (self.sky, self.ground, self.tree_program):
@@ -370,10 +373,22 @@ class Renderer:
         self.ground["vp"].write(packed)
         self.tree_program["vp"].write(packed)
         self.detail.use(0)
-        if self.terrain_vao is not None:
-            self.terrain_vao.render(moderngl.TRIANGLES)
         planes = frustum_planes(view_projection)
+        if self.terrain_vao is not None:
+            self._draw_terrain(planes)
         self.last_tree_count = sum(batch.draw(camera.position, planes) for batch in self.batches)
+        self.ctx.scissor = None
+
+    def _draw_terrain(self, planes: np.ndarray) -> None:
+        """Draw the terrain tiles inside the frustum, neighbouring tiles in one call."""
+        tiles = self.tiles
+        inside = np.all(tiles.centres @ planes[:, :3].T + planes[:, 3] > -tiles.radii[:, None], axis=1)
+        visible = np.flatnonzero(inside)
+        if len(visible) == 0:
+            return
+        for run in np.split(visible, np.flatnonzero(np.diff(visible) != 1) + 1):
+            first = int(tiles.starts[run[0]])
+            self.terrain_vao.render(moderngl.TRIANGLES, vertices=int(tiles.ends[run[-1]]) - first, first=first)
 
     def release(self) -> None:
         for batch in self.batches:

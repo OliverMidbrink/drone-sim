@@ -17,6 +17,8 @@ Controls (same feel as the 3D-SLAM map viewer):
     R            back to the start pose
     N            generate a new random world
     Esc          quit
+
+For the drone with thrusters, PID control, side cameras and an IMU, run fpv.py instead.
 """
 
 from __future__ import annotations
@@ -47,8 +49,8 @@ MOUSE_SENSITIVITY = 0.0025  # radians per pixel
 GROUND_CLEARANCE = 1.0  # metres kept above the terrain while the ground clamp is on
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_world_arguments(parser: argparse.ArgumentParser) -> None:
+    """The options that describe the world and the window, shared with fpv.py."""
     parser.add_argument("--seed", type=int, default=None, help="world seed (default: random)")
     parser.add_argument("--size", type=float, default=2000.0, help="terrain width in metres")
     parser.add_argument("--resolution", type=int, default=801, help="terrain grid points per side (lower = faster start)")
@@ -56,16 +58,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--godot-dir", type=Path, default=None, help="the Godot forest demo (default: godot-forest-demo-* in the project root)")
     parser.add_argument("--heightmap", type=Path, default=None, help="greyscale image to use as the terrain instead of generating one")
     parser.add_argument("--heightmap-max", type=float, default=600.0, help="metres for a white pixel of --heightmap")
-    parser.add_argument("--export-heightmap", type=Path, default=None, help="write the generated terrain as a 16-bit PNG and exit")
     parser.add_argument("--low-mountains", action="store_true", help="start with the mountains lowered to about twice a tree's height (M toggles)")
-    parser.add_argument("--fov", type=float, default=90.0, help="horizontal field of view in degrees")
     parser.add_argument("--visibility", type=float, default=3500.0, help="fog distance in metres")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--no-vsync", action="store_true", help="uncap the frame rate")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_world_arguments(parser)
+    parser.add_argument("--export-heightmap", type=Path, default=None, help="write the generated terrain as a 16-bit PNG and exit")
+    parser.add_argument("--fov", type=float, default=90.0, help="horizontal field of view in degrees")
     parser.add_argument("--screenshot", type=Path, default=None, help="render one frame to this image and exit (no window)")
     parser.add_argument("--pose", type=float, nargs=5, metavar=("X", "Y", "Z", "YAW_DEG", "PITCH_DEG"), help="camera pose for --screenshot (y is the altitude)")
     return parser.parse_args()
+
+
+def open_window(width: int, height: int, title: str, vsync: bool = True):
+    """(glfw window, moderngl context) for a normal on-screen window with 4x MSAA."""
+    if not glfw.init():
+        raise SystemExit("GLFW failed to initialize")
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+    glfw.window_hint(glfw.SAMPLES, 4)
+    window = glfw.create_window(width, height, title, None, None)
+    if window is None:
+        glfw.terminate()
+        raise SystemExit("Could not create an OpenGL window")
+    glfw.make_context_current(window)
+    glfw.swap_interval(1 if vsync else 0)
+    return window, moderngl.create_context()
 
 
 def build_world(args: argparse.Namespace, seed: int, models) -> World:
@@ -101,19 +125,7 @@ def take_screenshot(args: argparse.Namespace, seed: int) -> None:
 class Simulator:
     def __init__(self, args: argparse.Namespace, seed: int) -> None:
         self.args = args
-        if not glfw.init():
-            raise SystemExit("GLFW failed to initialize")
-        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-        glfw.window_hint(glfw.SAMPLES, 4)
-        self.window = glfw.create_window(args.width, args.height, "virtual-sim", None, None)
-        if self.window is None:
-            glfw.terminate()
-            raise SystemExit("Could not create an OpenGL window")
-        glfw.make_context_current(self.window)
-        glfw.swap_interval(0 if args.no_vsync else 1)
-        self.ctx = moderngl.create_context()
+        self.window, self.ctx = open_window(args.width, args.height, "virtual-sim", not args.no_vsync)
 
         self.models = load_models(args.godot_dir) if args.trees > 0 else []
         self.renderer = Renderer(self.ctx, self.models, args.visibility)

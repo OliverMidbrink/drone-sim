@@ -88,6 +88,7 @@ class RawSlam:
     def __init__(self, first_frame: np.ndarray, intrinsic: np.ndarray, exclude_mask: np.ndarray | None = None) -> None:
         """`exclude_mask`: uint8 image, 0 where the frame must be ignored (overlays, the drone's own body)."""
         self.exclude_mask = exclude_mask
+        self.min_parallax = KEYFRAME_MIN_PARALLAX_PX
         self.intrinsic = intrinsic
         self.intrinsic_inverse = np.linalg.inv(intrinsic)
         self.frame_number = 0
@@ -183,6 +184,15 @@ class RawSlam:
         return changed
 
     # ------------------------------------------------------------------ pose step
+    # Two hooks a subclass may replace (the raw engine uses the plain versions).
+    def _parallax(self, key_px: np.ndarray, current_px: np.ndarray) -> float:
+        """How far the tracks moved against the keyframe (px): the test for computing a pose at all."""
+        return float(np.median(np.linalg.norm(current_px - key_px, axis=1)))
+
+    def _estimate_motion(self, key_px: np.ndarray, current_px: np.ndarray):
+        """(rotation, unit translation, inlier mask) from the keyframe's camera to the current one, or None."""
+        return estimate_motion(key_px, current_px, self.intrinsic)
+
     def _try_step(self, gray: np.ndarray) -> tuple[bool, bool]:
         """(pose changed, start a new keyframe)"""
         if len(self.key_ids) == 0:
@@ -194,13 +204,13 @@ class RawSlam:
         key_px = self.key_points[position[matched]]
         current_px = self.track_points[matched]
         ids = self.track_ids[matched]
-        parallax = float(np.median(np.linalg.norm(current_px - key_px, axis=1)))
-        if parallax < KEYFRAME_MIN_PARALLAX_PX:
+        parallax = self._parallax(key_px, current_px)
+        if parallax < self.min_parallax:
             return False, False
-        motion = estimate_motion(key_px, current_px, self.intrinsic)
+        motion = self._estimate_motion(key_px, current_px)
         if motion is None:
             self.failed_fits += 1
-            return False, parallax > 4.0 * KEYFRAME_MIN_PARALLAX_PX
+            return False, parallax > 4.0 * self.min_parallax
         rotation, translation, inliers = motion
         current_px, ids = current_px[inliers], ids[inliers]
 

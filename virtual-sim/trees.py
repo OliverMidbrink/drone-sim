@@ -30,7 +30,15 @@ SPECIES = [
 ]
 TREELINE = (150.0, 250.0)  # trees thin out between these altitudes
 SPAWN_CLEARING = 12.0  # metres around the origin kept free of trees
+PROFILE_BINS = 12
 SINK = 0.15  # metres the trunk base is sunk into the ground
+
+
+@dataclass
+class Collider:
+    offset: tuple[float, float]  # trunk axis relative to the model origin (x, z), at 1 m tall
+    top: float  # highest point, at 1 m tall
+    profile: np.ndarray  # sideways reach in PROFILE_BINS height slices from the ground up, at 1 m tall
 
 
 @dataclass
@@ -38,6 +46,7 @@ class TreeModel:
     species: Species
     model: Model  # normalised: 1 m tall, trunk base at the origin
     radius: float  # bounding sphere around (0, 0.5, 0), for culling
+    colliders: list[Collider]
 
 
 def find_godot_objects(godot_dir: Path | None) -> Path | None:
@@ -65,6 +74,37 @@ def _normalise(model: Model) -> float:
     return radius
 
 
+def _colliders(model: Model) -> list[Collider]:
+    """One collider per trunk. Parts that share an axis (trunk + foliage) form one tree; some models
+    (the pine-tree-4 clump) hold several trees side by side, which are kept apart."""
+    groups: list[list] = []
+    for primitive in model.primitives:
+        centre = (primitive.positions[:, [0, 2]].min(axis=0) + primitive.positions[:, [0, 2]].max(axis=0)) / 2.0
+        for group in groups:
+            if np.linalg.norm(group[0] - centre) < 0.25:
+                group[1].append(primitive)
+                break
+        else:
+            groups.append([centre, [primitive]])
+    colliders = []
+    for _, parts in groups:
+        points = np.concatenate([p.positions for p in parts])
+        low = points[:, 1].min()
+        axis = points[points[:, 1] < low + 0.05][:, [0, 2]].mean(axis=0)
+        radial = np.hypot(points[:, 0] - axis[0], points[:, 2] - axis[1])
+        slice_of = np.minimum((points[:, 1] * PROFILE_BINS).astype(int), PROFILE_BINS - 1)
+        reach = np.full(PROFILE_BINS, np.nan)
+        for bin_index in range(PROFILE_BINS):
+            in_slice = radial[slice_of == bin_index]
+            if len(in_slice):
+                reach[bin_index] = max(0.02, float(np.percentile(in_slice, 85)))  # 85th: stray leaf tips do not count
+        known = np.flatnonzero(~np.isnan(reach))
+        profile = np.full(PROFILE_BINS, 0.02)
+        profile[known[0] : known[-1] + 1] = np.interp(np.arange(known[0], known[-1] + 1), known, reach[known])
+        colliders.append(Collider((float(axis[0]), float(axis[1])), float(points[:, 1].max()), profile))
+    return colliders
+
+
 def load_models(godot_dir: Path | None = None) -> list[TreeModel]:
     objects = find_godot_objects(godot_dir)
     if objects is None:
@@ -77,7 +117,8 @@ def load_models(godot_dir: Path | None = None) -> list[TreeModel]:
             print(f"Tree model missing, skipped: {path}")
             continue
         model = load_gltf(path)
-        models.append(TreeModel(species, model, _normalise(model)))
+        radius = _normalise(model)
+        models.append(TreeModel(species, model, radius, _colliders(model)))
     return models
 
 

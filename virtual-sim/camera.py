@@ -17,9 +17,12 @@ class Camera:
     pitch: float = 0.0  # radians, looking up is positive
     roll: float = 0.0  # radians, leaning to the right is positive
     fov_deg: float = 90.0  # horizontal field of view
+    basis: tuple | None = None  # (forward, right, up) that replaces yaw / pitch / roll, for cameras mounted on a body
 
     def axes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(forward, right, up) unit vectors, roll included."""
+        if self.basis is not None:
+            return self.basis
         cos_pitch = np.cos(self.pitch)
         forward = np.array([np.sin(self.yaw) * cos_pitch, np.sin(self.pitch), -np.cos(self.yaw) * cos_pitch])
         right = np.cross(forward, UP)
