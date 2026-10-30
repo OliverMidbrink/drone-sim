@@ -73,6 +73,7 @@ from sensors import SensorNoise, SensorSample, SensorSuite, StateEstimator  # no
 from simulator import add_world_arguments, build_world, open_window  # noqa: E402
 from trees import load_models  # noqa: E402
 
+STATE_EVERY = 250  # physics ticks between rows of the --diag state log (0.5 s)
 PHYSICS_DT = 1.0 / 500.0
 CONTROL_EVERY = 2  # physics steps per flight-controller / IMU sample: 250 Hz
 HISTORY_EVERY = 4  # control ticks per chart sample
@@ -127,6 +128,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-accel", type=float, default=2.0, help="largest acceleration the route may ask for (m/s^2); 9.81 * tan(tilt)")
     parser.add_argument("--route-dwell", type=float, default=1.0, help="seconds to hover at each waypoint")
     parser.add_argument("--wind", type=float, default=None, help="mean wind m/s (default 1.0 with --slam, else 0); gusts come on top")
+    parser.add_argument("--diag", type=Path, default=None, metavar="PREFIX", help="with --slam: log truth vs estimate and every SLAM pose to PREFIX_state.csv / PREFIX_slam.csv (tools/diag_report.py summarises them)")
     parser.add_argument("--hold-test", type=float, default=None, metavar="SECONDS", help="with --slam: no window, fly this long, print how far the drone wandered")
     parser.add_argument("--record", type=Path, default=None, help="folder for left.mp4, right.mp4, imu.csv and poses.csv")
     parser.add_argument("--run-seconds", type=float, default=None, help="quit after this long and print frame rates (for benchmarking)")
@@ -205,6 +207,11 @@ class FpvApp:
         self.last_sample: SensorSample | None = None
         self.banner = ("", -1e9)
         self.recorder: Recorder | None = Recorder(args.record, (width, height), args.cam_fps) if args.record else None
+        self.diag = None
+        if args.diag and self.slam:
+            from diagnostics import FlightDiagnostics
+
+            self.diag = FlightDiagnostics(args.diag)
         self.accumulator = 0.0
         self.tick = 0
         self.next_frame = 0.0
@@ -252,6 +259,8 @@ class FpvApp:
         if self.slam:
             print(self.sensors.describe())
         self.controller.reset(airborne=False)
+        if self.diag is not None:
+            self.diag.reset()
         # the estimator's world W: origin at the start, nose heading at the start is "forward"; true = start + W_axes @ p_W
         forward = np.array([np.sin(yaw), 0.0, -np.cos(yaw)])
         right = np.array([np.cos(yaw), 0.0, np.sin(yaw)])
@@ -403,6 +412,8 @@ class FpvApp:
             if self.mission == "route" and self.route is not None:
                 self.controller.reference = self.route.sample(sample.t)
             self.controller.update(sample, pilot, quad.on_ground)
+            if self.diag is not None and self.tick % STATE_EVERY == 0:
+                self.diag.state_row(self)
             self._publish(sample)
             if (self.tick // CONTROL_EVERY) % HISTORY_EVERY == 0:
                 self._record_history(sample)
@@ -536,7 +547,10 @@ class FpvApp:
         if result.changed and result.stats["steps"] > 0:
             if DEBUG:
                 self._debug_pose(result)
+            before = self.diag.before(self.estimator, result.name) if self.diag is not None else None
             self.estimator.slam_pose(result.name, result.t, result.rotation, result.position)
+            if self.diag is not None:
+                self.diag.pose(self, result, before)
 
     def _debug_pose(self, result) -> None:
         """Developer check (DRONE_DEBUG=1): how wrong the SLAM's and the filter's attitude and position are against the truth. Nothing reads this back."""
@@ -813,6 +827,8 @@ class FpvApp:
         glfw.terminate()
 
     def close(self) -> None:
+        if self.diag is not None:
+            self.diag.close()
         if self.recorder:
             self.recorder.close()
         if self.link is not None:
