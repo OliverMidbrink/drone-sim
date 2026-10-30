@@ -29,29 +29,32 @@ class RobotModel:
 
     def __init__(self, renderer: OfficeRenderer, params: RobotParams) -> None:
         self.params = params
-        r, w = params.wheel_radius, 0.026
-        depth, width, height = params.body_size[0], params.track - 0.06, 2.0 * (params.com_height - 0.02)
-        base = 0.02  # the underside of the body above the axle; the box is centred on the centre of mass
+        r, w = params.wheel_radius, 0.045
+        depth, height = params.body_size[0], params.body_size[2]
+        width = 0.7 * params.track  # the box between the wheels
+        base = params.com_height - height / 2.0  # the underside of the body above the axle; the box is centred on the centre of mass
+        top = base + height
         body = [
             geometry.box((0, base + height * 0.5, 0), (depth, height, width), BODY),  # the chassis box
-            geometry.box((0, base + height + 0.004, 0), (depth + 0.012, 0.008, width + 0.012), TRIM),  # top plate
-            geometry.box((depth / 2 + 0.002, base + height * 0.62, 0), (0.004, height * 0.18, width * 0.62), DARK),  # front panel
-            geometry.box((depth / 2 + 0.004, base + height * 0.62, -width * 0.18), (0.004, 0.018, 0.018), SENSOR),  # the two "eyes"
-            geometry.box((depth / 2 + 0.004, base + height * 0.62, width * 0.18), (0.004, 0.018, 0.018), SENSOR),
-            geometry.box((0, base + height * 0.30, 0), (depth + 0.004, 0.012, width + 0.004), TRIM),  # a stripe round the middle
-            geometry.cylinder((0, base + height + 0.04, 0), 0.006, 0.08, DARK),  # an antenna
-            geometry.cylinder((0, base + height + 0.083, 0), 0.01, 0.014, MARK),
+            geometry.box((0, top + 0.006, 0), (depth + 0.02, 0.012, width + 0.02), TRIM),  # top plate
+            geometry.box((depth / 2 + 0.003, base + height * 0.72, 0), (0.006, height * 0.16, width * 0.7), DARK),  # front panel
+            geometry.box((depth / 2 + 0.007, base + height * 0.72, -width * 0.2), (0.006, 0.035, 0.035), SENSOR),  # the two "eyes"
+            geometry.box((depth / 2 + 0.007, base + height * 0.72, width * 0.2), (0.006, 0.035, 0.035), SENSOR),
+            geometry.box((0, base + height * 0.30, 0), (depth + 0.008, 0.03, width + 0.008), TRIM),  # a stripe round the lower part
+            geometry.box((0, base + height * 0.52, 0), (depth + 0.008, 0.03, width + 0.008), TRIM),  # and one higher up
+            geometry.cylinder((0, top + 0.1, 0), 0.008, 0.2, DARK),  # an antenna
+            geometry.cylinder((0, top + 0.205, 0), 0.02, 0.025, MARK),
         ]
-        motor_length = 0.02
+        motor_length = 0.025
         for side in (-1.0, 1.0):
             z = side * (width / 2 + motor_length / 2)
-            body.append(geometry.cylinder((0, 0, z), 0.018, motor_length, srgb(150, 150, 155), axis=2))  # the gearmotors
-            body.append(geometry.box((0, 0.5 * base, side * width * 0.5 * 0.9), (depth * 0.7, 0.02, 0.016), DARK))  # their brackets
-        wheel = [geometry.cylinder((0, 0, 0), r, w, TYRE, axis=2, segments=40)]
-        wheel.append(geometry.cylinder((0, 0, 0), r * 0.62, w + 0.002, HUB, axis=2, segments=32))
+            body.append(geometry.cylinder((0, 0, z), 0.04, motor_length, srgb(150, 150, 155), axis=2))  # the gearmotors
+            body.append(geometry.box((0, 0.5 * base, side * width * 0.5 * 0.9), (depth * 0.7, base, 0.03), DARK))  # their brackets
+        wheel = [geometry.cylinder((0, 0, 0), r, w, TYRE, axis=2, segments=48)]
+        wheel.append(geometry.cylinder((0, 0, 0), r * 0.62, w + 0.003, HUB, axis=2, segments=36))
         for spoke in range(3):  # three marks so the rolling can be seen
             angle = spoke * 2.0 * np.pi / 3.0
-            wheel.append(geometry.box((np.cos(angle) * r * 0.38, np.sin(angle) * r * 0.38, 0), (0.012, 0.012, w + 0.006), MARK if spoke == 0 else DARK))
+            wheel.append(geometry.box((np.cos(angle) * r * 0.38, np.sin(angle) * r * 0.38, 0), (0.025, 0.025, w + 0.008), MARK if spoke == 0 else DARK))
         self.body: DynamicModel = renderer.make_model(body)
         self.wheel: DynamicModel = renderer.make_model(wheel)
 

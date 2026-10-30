@@ -15,6 +15,11 @@ from robot.sensors import ImuSpec  # noqa: E402
 from robot.sim import Box, RobotSim  # noqa: E402
 
 
+def shove(sim: RobotSim, newtons_for_a_light_robot: float, duration: float = 0.15) -> None:
+    """A push that is the same fraction of the robot's weight whatever its size (the numbers were chosen for the 1.1 kg compact robot)."""
+    sim.push(newtons_for_a_light_robot * sim.params.total_mass / 1.1, duration)
+
+
 def stand(seed: int = 0, seconds: float = 6.0) -> RobotSim:
     sim = RobotSim(seed=seed)
     sim.advance(seconds)
@@ -59,7 +64,7 @@ def test_energy_is_conserved_without_losses():
     e0 = energy()
     for _ in range(int(0.25 / 0.0005)):
         plant.step(0.0005, np.zeros(2))
-    assert abs(energy() - e0) < 2e-3  # joules
+    assert abs(energy() - e0) < 2e-3 * p.body_mass * 9.81 * plant.com_distance  # 0.2 % of the weight times the height
 
 
 def test_balances_standing_still_for_several_builds():
@@ -84,23 +89,34 @@ def test_drives_and_turns():
     sim.command = Command(speed=0.4)
     sim.advance(4.0)
     assert not sim.plant.fallen
-    assert 0.25 < sim.plant.speed < 0.6
+    assert 0.35 < sim.plant.speed < 0.45
     sim.command = Command(speed=0.0, yaw_rate=1.0)
     sim.advance(2.0)
     assert not sim.plant.fallen and 0.7 < sim.plant.yaw_rate < 1.3
 
 
+def test_the_compact_robot_balances_too():
+    sim = RobotSim(seed=3, nominal=RobotParams.compact())
+    sim.advance(6.0)
+    sim.command = Command(speed=0.4)
+    sim.advance(4.0)
+    assert not sim.plant.fallen and 0.35 < sim.plant.speed < 0.45
+    shove(sim, 3.0)
+    sim.advance(3.0)
+    assert not sim.plant.fallen
+
+
 def test_recovers_from_pushes():
     sim = stand(2, 5.0)
     for force in (2.0, -3.0, 5.0):
-        sim.push(force, 0.15)
+        shove(sim, force)
         sim.advance(4.0)
         assert not sim.plant.fallen and abs(np.degrees(sim.plant.pitch)) < 6.0
 
 
 def test_falls_on_a_huge_shove_and_gets_up_again():
     sim = stand(0, 4.0)
-    sim.push(30.0, 0.2)
+    shove(sim, 30.0, 0.2)
     sim.advance(3.0)
     assert sim.plant.fallen and sim.firmware.state == "cutoff"  # the motors are cut when it is down
     sim.stand_up()
@@ -110,7 +126,7 @@ def test_falls_on_a_huge_shove_and_gets_up_again():
 
 def test_motor_current_is_limited_and_battery_sags():
     sim = stand(0, 4.0)
-    sim.push(8.0, 0.2)
+    shove(sim, 8.0, 0.2)
     peak = 0.0
     for _ in range(4000):
         sim.advance(0.0005)

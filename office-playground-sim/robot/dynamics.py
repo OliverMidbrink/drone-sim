@@ -202,10 +202,10 @@ class TwipPlant:
         dt: float,
         duty: np.ndarray,
         push_force: float = 0.0,
-        push_height: float = 0.12,
+        push_height: float | None = None,
         yaw_torque: float = 0.0,
         contacts: list[Contact] | None = None,
-        contact_height: float = 0.05,
+        contact_height: float | None = None,
         held: bool = False,
     ) -> None:
         """Advance by dt seconds. `duty` is the H-bridge duty (-1..1) of the left and right motor.
@@ -214,6 +214,8 @@ class TwipPlant:
         """
         p = self.p
         theta = float(self.q[2])
+        push_height = 1.2 * p.com_height if push_height is None else push_height
+        contact_height = 0.5 * p.com_height if contact_height is None else contact_height
         torque, friction = self._motors(dt, np.asarray(duty, float))
         total_load = p.total_mass * GRAVITY - p.body_mass * self.com_distance * (self.qdd[2] * np.sin(theta + self.com_angle) + self.qd[2] ** 2 * np.cos(theta + self.com_angle))
         total_load = max(total_load, 0.1 * p.total_mass * GRAVITY)

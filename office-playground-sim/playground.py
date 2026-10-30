@@ -1,4 +1,4 @@
-"""Office playground: walk around the office and watch a two-wheeled robot balance in it.
+"""Office playground: walk around the office and watch a big two-wheeled robot balance in it.
 
     python office-playground-sim/playground.py
     python office-playground-sim/playground.py --seed 3            # another arrangement of the furniture
@@ -44,7 +44,7 @@ from robot.model import RobotModel  # noqa: E402
 from robot.sim import RobotSim  # noqa: E402
 
 MOUSE_SENSITIVITY = 0.0023
-DRIVE_SPEED = 0.7  # m/s
+DRIVE_SPEED = 1.0  # m/s
 DRIVE_TURN = 1.8  # rad/s
 MODES = ("walk", "follow", "ride")
 HUD_SIZE = (460, 250)
@@ -92,9 +92,9 @@ class Scene:
             return
         yaw = self.walker.yaw
         ahead = np.array([np.sin(yaw), -np.cos(yaw)])
-        target = self.walker.position + ahead * 1.6
-        if not self.layout.is_free(float(target[0]), float(target[1]), 0.2):
-            target = self.walker.position + ahead * 0.9
+        target = self.walker.position + ahead * 2.0
+        if not self.layout.is_free(float(target[0]), float(target[1]), 0.3):
+            target = self.walker.position + ahead * 1.3
         self.robot.place(float(target[0]), float(target[1]), float(np.arctan2(-ahead[1], -ahead[0])))  # facing the walker
 
     def reset_robot(self) -> None:
@@ -120,7 +120,7 @@ class Scene:
             def world(v: np.ndarray) -> np.ndarray:
                 return np.array([v[0] * c - v[2] * s, v[1], v[0] * s + v[2] * c])
 
-            mast = world(lean_forward * 0.04 + lean_up * 0.20)
+            mast = world(lean_forward * (p.body_size[0] / 2.0 + 0.02) + lean_up * (p.com_height + 0.3))  # on the front face, near the top
             position = np.array([plant.x, p.wheel_radius, plant.z]) + mast
             right = world(np.array([0.0, 0.0, 1.0]))
             return Camera(position, basis=(world(lean_forward), right, world(lean_up)), fov_deg=self.fov)
@@ -130,8 +130,8 @@ class Scene:
         yaw = self.chase_heading + np.pi / 2.0 + self.chase_offset[0]
         pitch = self.chase_offset[1]
         forward = np.array([np.sin(yaw) * np.cos(pitch), np.sin(pitch), -np.cos(yaw) * np.cos(pitch)])
-        target = np.array([plant.x, 0.13, plant.z])
-        distance = self._clear_distance(target, -forward, 0.85)
+        target = np.array([plant.x, robot.params.com_height, plant.z])
+        distance = self._clear_distance(target, -forward, 2.4)
         return Camera(target - forward * distance, yaw, pitch, 0.0, self.fov)
 
     def _clear_distance(self, origin: np.ndarray, direction: np.ndarray, wanted: float) -> float:
@@ -216,9 +216,9 @@ class Playground:
             self.hud = not self.hud
         elif scene.robot:
             if key == glfw.KEY_P:
-                scene.robot.push(3.0, 0.12)
+                scene.robot.push(20.0, 0.12)
             elif key == glfw.KEY_O:
-                scene.robot.push(-3.0, 0.12)
+                scene.robot.push(-20.0, 0.12)
             elif key == glfw.KEY_U:
                 scene.robot.stand_up()
             elif key == glfw.KEY_T:

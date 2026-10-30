@@ -106,10 +106,18 @@ class LqrWeights:
     integral: float = 0.3
     voltage: float = 0.1  # cost of volts: high enough that the loop keeps its margin against the sample delay and the sensor filter
 
+    @classmethod
+    def for_robot(cls, params: RobotParams) -> "LqrWeights":
+        """The same weights, with the cost of volts raised for heavier robots (found by trying: 0.1 for the 1 kg robot, about 1 for the 6 kg one).
+
+        Without it the big robot's loop sits at the edge of its delay margin and chatters at full motor current.
+        """
+        return cls(voltage=0.1 * params.body_mass**1.25)
+
 
 def design_lqr(params: RobotParams, weights: LqrWeights | None = None, rate: float = CONTROL_RATE) -> np.ndarray:
     """Feedback gain K (1x5) on (position error, speed error, pitch, pitch rate, integral of position error), volts per unit."""
-    w = weights or LqrWeights()
+    w = weights or LqrWeights.for_robot(params)
     a, b = linear_pitch_model(params)
     dt = 1.0 / rate
     # augment with the integral of the position: z' = position
@@ -152,7 +160,11 @@ class BalanceFirmware:
         m = nominal.motor
         self.counts_per_wheel_radian = self.encoder.counts_per_motor_rev * m.gear_ratio / (2.0 * np.pi)
         self.steer_feed_forward = m.torque_constant * m.gear_ratio * (nominal.track / 2.0) / nominal.wheel_radius  # V per rad/s of yaw rate
+        self.speed_feed_forward = m.torque_constant * m.gear_ratio / nominal.wheel_radius  # V per m/s: the back-EMF at that speed
         self.calibration_time = calibration_time
+        # the pitch feeds the position (through the wheel angle), the position the acceleration estimate, and that the pitch:
+        # the loop gain grows with the wheel radius, so the acceleration filter is slowed down for bigger wheels
+        self.acceleration_gain = 0.06 * min(1.0, 0.04 / nominal.wheel_radius)
         self.accel_limit = 0.8  # m/s^2: the fastest the reference speed may change
         self.lean_gain = 0.6
         self.reset()
@@ -209,7 +221,7 @@ class BalanceFirmware:
             previous_speed = self.speed
             self.position += self.speed * self.dt + 0.55 * error
             self.speed += 0.09 * error / self.dt
-            self.acceleration += 0.06 * ((self.speed - previous_speed) / self.dt - self.acceleration)
+            self.acceleration += self.acceleration_gain * ((self.speed - previous_speed) / self.dt - self.acceleration)
         self.counts_previous = counts
 
     # --- control -------------------------------------------------------------------------------
@@ -266,7 +278,7 @@ class BalanceFirmware:
         if abs(self.speed_ref) < 0.02 and abs(command.speed) < 0.02:  # the trim only integrates while standing still
             self.integral = float(np.clip(self.integral + position_error * self.dt, -0.5, 0.5))
         state = np.array([position_error, speed_error, self.pitch - pitch_ref, self.pitch_rate, self.integral])
-        common = float(-self.gain @ state)
+        common = float(-self.gain @ state) + self.speed_feed_forward * self.speed_ref  # the feed-forward carries the back-EMF, so cruising does not need a speed error
 
         yaw_error = command.yaw_rate - self.yaw_rate
         self.yaw_integral = float(np.clip(self.yaw_integral + yaw_error * self.dt, -3.0, 3.0))
