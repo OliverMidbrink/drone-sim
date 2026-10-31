@@ -24,6 +24,15 @@ const PATHS = {
   cube: 'M12 3l8 4.5v9L12 21l-8-4.5v-9z M4 7.5l8 4.5 8-4.5 M12 12v9',
   folder: 'M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z',
   close: 'M6 6l12 12 M18 6L6 18',
+  grid: 'M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z',
+  plus: 'M12 5v14 M5 12h14',
+  chevUp: 'M6 15l6-6 6 6',
+  chevDown: 'M6 9l6 6 6-6',
+  chevLeft: 'M15 6l-6 6 6 6',
+  chevRight: 'M9 6l6 6-6 6',
+  rotateCw: 'M21 12a9 9 0 11-3-6.7 M21 4v5h-5',
+  rotateCcw: 'M3 12a9 9 0 103-6.7 M3 4v5h5',
+  home: 'M3 11l9-8 9 8 M5 10v10h5v-6h4v6h5V10',
 } as const
 
 export type IconName = keyof typeof PATHS

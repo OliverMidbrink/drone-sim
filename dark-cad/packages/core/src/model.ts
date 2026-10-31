@@ -90,6 +90,6 @@ export interface Document {
 
 export const FORMAT_VERSION = 1
 
-export function emptyDocument(name = 'Untitled design'): Document {
+export function emptyDocument(name = 'Untitled'): Document {
   return { version: FORMAT_VERSION, name, units: 'mm', features: [] }
 }

@@ -13,7 +13,7 @@ export class Store {
     this.counter = doc.features.length
   }
 
-  subscribe(fn: () => void) { this.listeners.add(fn); return () => this.listeners.delete(fn) }
+  subscribe(fn: () => void) { this.listeners.add(fn); return () => { this.listeners.delete(fn) } }
   private emit() { this.listeners.forEach((f) => f()) }
 
   nextId(prefix: string): string {
@@ -64,3 +64,6 @@ export class Store {
 
   replace(doc: Document) { this.past = []; this.future = []; this.lastKey = undefined; this.doc = doc; this.counter = doc.features.length; this.emit() }
 }
+
+/** What the UI needs from a document store; implemented by `Store` and by the multi-design workspace. */
+export type DocStore = Pick<Store, 'doc' | 'subscribe' | 'nextId' | 'add' | 'update' | 'remove' | 'move' | 'rename' | 'canUndo' | 'canRedo' | 'undo' | 'redo' | 'replace'>

@@ -11,7 +11,7 @@ First use case: pump pipe adapters, so threads (BSP and metric, male and female)
 nvm use            # Node 22 (see .nvmrc)
 pnpm install
 pnpm dev           # http://localhost:5173
-pnpm test          # kernel, features, standards, core, io
+pnpm test          # kernel, features, standards, core, io, workspace
 pnpm e2e           # production build driven in headless Chromium
 pnpm desktop       # build + open the Electron app
 ```
@@ -20,12 +20,20 @@ If Electron starts as plain Node, `ELECTRON_RUN_AS_NODE` is set in your environm
 
 ## Using it
 
-- **✎ Sketch** → draw rectangles, circles, polygons (keys `V R C P`; shapes inside shapes become holes). Edit exact numbers in the right panel.
-- Select a sketch, **⬒ Extrude** (new / add / cut). **◭ Loft** between two sketches (Ctrl-click). **⊕ Combine** two bodies (union / cut / common).
-- **⌇ Thread**: pick a standard and size in the dropdown, click a cylindrical face (boss or hole wall). Boss → male, hole → female.
-  The cylinder is resized to the table size first (male → major Ø, female → tap-drill Ø), then the helical thread is cut.
-- **⌫ Delete feature**: click any face of a boss, rib, pocket or hole; the whole feature is removed and the surface healed.
-- Import / export: DXF (2D sketches), STEP, STL, and the native `.darkcad` file (canonical JSON, diff-friendly). Autosaves to the browser.
+- **Tabs:** the top bar is `DarkCAD`, a grid icon, then one tab per open design (`Untitled` by default). `+` opens a new design,
+  double-click a tab to rename it, `×` closes it. The grid icon lists every saved design to reopen or delete.
+  Designs autosave in the browser; each has its own undo history. The folder/save icons on the right open and save `.darkcad` files.
+- **Create Sketch:** the three origin planes light up in yellow, click one. The camera swings to look straight at that plane in
+  orthographic projection, with the model (translucent) and your other sketches still visible, in the same global coordinates.
+  Draw rectangles, circles, polygons (`V R C P`); a shape inside another becomes a hole. Edit exact numbers in the panel on the right.
+  `Finish sketch` (or `Esc`) returns to your previous view.
+- **3D:** select a sketch, **Extrude** (new / add / cut). **Loft** between two sketches (Ctrl-click). **Combine** two bodies.
+- **Modify → Thread:** options open on the right (size, male/female/auto, length). Click a cylindrical face: a boss becomes a male
+  thread, a hole wall a female one. The cylinder is resized to the screw size first (male → major Ø, female → tap-drill Ø).
+- **Modify → Delete feature:** click any face of a boss, rib, pocket or hole; the whole feature is removed and the surface healed.
+- **Import / Export:** DXF import (new sketch); STEP, STL and DXF export.
+- **View cube** (top right): click a face, edge or corner to look from there; drag it to orbit; the arrows step the view 90°
+  (the two curved ones roll it); the house resets; `Persp / Ortho` switches projection. Front is -Y, Right is +X, Z is up.
 - Undo / redo (`Ctrl+Z`, `Ctrl+Shift+Z`), `F` fits the view, `Esc` cancels a tool.
 
 ## Layout
