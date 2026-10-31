@@ -44,3 +44,14 @@ describe('thread tool', () => {
     expect(isValid(oc, rod)).toBe(true)
   })
 })
+
+describe('placement', () => {
+  it('a translated rod really lands at its origin (regression: inverted placement transform)', () => {
+    const rod = threadedRod(oc, { designation: 'M8', kind: 'male', length: 10, origin: [3, -2, 7], dir: [0, 0, 1] })
+    const b = tightBounds(oc, rod)
+    expect(b.min[2]).toBeGreaterThan(7 - 1.1)
+    expect(b.max[2]).toBeGreaterThan(7 + 10)
+    expect((b.min[0] + b.max[0]) / 2).toBeCloseTo(3, 1)
+    expect((b.min[1] + b.max[1]) / 2).toBeCloseTo(-2, 1)
+  })
+})

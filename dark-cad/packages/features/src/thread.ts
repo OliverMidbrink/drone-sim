@@ -1,4 +1,5 @@
 import { call, make } from '@darkcad/kernel/occ'
+import { placeFrame } from '@darkcad/kernel/shape'
 import { threadRidge } from '@darkcad/kernel/thread'
 import { findSize, threadDims, type Kind } from '@darkcad/standards'
 
@@ -15,13 +16,7 @@ export interface ThreadOp {
 /** Extra length either side so booleans never see coincident end faces. */
 const RUNOUT = 1
 
-function place(oc: any, shape: any, origin: [number, number, number], dir: [number, number, number]) {
-  const to = make(oc, 'gp_Ax3', make(oc, 'gp_Pnt', ...origin), make(oc, 'gp_Dir', ...dir))
-  const trsf = make(oc, 'gp_Trsf')
-  call(trsf, 'SetTransformation', to, make(oc, 'gp_Ax3')) // local frame (Z axis) → target frame
-  trsf.Invert()
-  return call(make(oc, 'BRepBuilderAPI_Transform', shape, trsf, true), 'Shape')
-}
+const place = (oc: any, shape: any, origin: [number, number, number], dir: [number, number, number]) => placeFrame(oc, shape, origin, dir)
 
 /** Local-frame geometry: axis = +Z from z = 0 (free end). Taper makes radius grow with z, as on R threads. */
 function localParts(oc: any, op: ThreadOp) {

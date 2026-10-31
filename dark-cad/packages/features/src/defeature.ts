@@ -54,3 +54,30 @@ export function deleteFeature(oc: any, shape: any, seedIndex: number, baseIndex?
   if (failed) throw new Error('defeaturing failed for this selection')
   return { shape: df.Shape(), removed: picked.length }
 }
+
+export interface FaceFingerprint { surface: string; centroid: [number, number, number]; area: number }
+
+export function fingerprintFace(oc: any, face: any): FaceFingerprint {
+  const g = make(oc, 'GProp_GProps')
+  call(oc.BRepGProp, 'SurfaceProperties', face, g, false, false)
+  const c = g.CentreOfMass()
+  const t = make(oc, 'BRepAdaptor_Surface', face, true).GetType()
+  const surface = Object.entries(oc.GeomAbs_SurfaceType).find(([, v]) => v === t)?.[0].replace('GeomAbs_', '') ?? 'Other'
+  return { surface, centroid: [c.X(), c.Y(), c.Z()], area: g.Mass() }
+}
+
+/** Re-find a face after upstream edits: same surface type, nearest centroid, similar area. Throws if nothing is close. */
+export function resolveFace(oc: any, shape: any, ref: FaceFingerprint, tol = 0.5): number {
+  let best = -1, bestScore = Infinity
+  faces(oc, shape).forEach((f, i) => {
+    const fp = fingerprintFace(oc, f)
+    if (fp.surface !== ref.surface) return
+    const d = Math.hypot(fp.centroid[0] - ref.centroid[0], fp.centroid[1] - ref.centroid[1], fp.centroid[2] - ref.centroid[2])
+    const da = Math.abs(fp.area - ref.area) / Math.max(ref.area, 1e-9)
+    if (d > tol || da > 0.05) return
+    const score = d + da
+    if (score < bestScore) { bestScore = score; best = i }
+  })
+  if (best < 0) throw new Error('reference lost: the picked face no longer exists')
+  return best
+}

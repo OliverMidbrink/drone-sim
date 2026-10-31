@@ -35,3 +35,13 @@ export function tightBounds(oc: any, shape: any, deflection = 0.005) {
   const lo = b.CornerMin(), hi = b.CornerMax()
   return { min: [lo.X(), lo.Y(), lo.Z()] as const, max: [hi.X(), hi.Y(), hi.Z()] as const }
 }
+
+/** Move a shape built in the local frame (Z axis, X to the right) onto a frame at `origin` with normal `dir` and optional x direction. */
+export function placeFrame(oc: any, shape: any, origin: [number, number, number], dir: [number, number, number], xdir?: [number, number, number]) {
+  const to = xdir
+    ? make(oc, 'gp_Ax3', make(oc, 'gp_Pnt', ...origin), make(oc, 'gp_Dir', ...dir), make(oc, 'gp_Dir', ...xdir))
+    : make(oc, 'gp_Ax3', make(oc, 'gp_Pnt', ...origin), make(oc, 'gp_Dir', ...dir))
+  const trsf = make(oc, 'gp_Trsf')
+  call(trsf, 'SetTransformation', to, make(oc, 'gp_Ax3')) // coordinates relative to `to` → global
+  return call(make(oc, 'BRepBuilderAPI_Transform', shape, trsf, true), 'Shape')
+}

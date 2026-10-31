@@ -17,6 +17,7 @@
     "./thread": "./src/thread.ts",
     "./shape": "./src/shape.ts",
     "./step": "./src/step.ts",
-    "./node": "./src/node.ts"
+    "./node": "./src/node.ts",
+    "./tessellate": "./src/tessellate.ts"
   }
 }
