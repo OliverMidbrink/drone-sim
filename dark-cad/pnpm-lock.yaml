@@ -36,6 +36,22 @@ importers:
         specifier: ^5.0.5
         version: 5.0.5(vite@8.3.5)
 
+  packages/io:
+    dependencies:
+      '@darkcad/core':
+        specifier: workspace:*
+        version: link:../core
+      '@darkcad/features':
+        specifier: workspace:*
+        version: link:../features
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.5
+        version: 5.0.5(vite@8.3.5)
+
   packages/kernel:
     dependencies:
       opencascade.js:

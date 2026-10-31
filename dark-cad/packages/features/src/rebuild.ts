@@ -63,7 +63,7 @@ export function rebuild(oc: any, doc: Document): BuildResult {
           break
         }
         case 'thread': {
-          const op = { designation: f.designation, kind: f.kind, length: f.length, origin: f.origin, dir: f.dir }
+          const op = { designation: f.designation, kind: f.kind, length: f.length, origin: f.origin, dir: f.dir, existingRadius: f.existingRadius }
           out = f.kind === 'male' ? fuseThreadedBoss(oc, body(f.target), op) : cutThreadedHole(oc, body(f.target), op)
           consumed.add(f.target)
           break

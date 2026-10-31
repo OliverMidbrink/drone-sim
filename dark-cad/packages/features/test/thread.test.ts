@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest'
-import { make } from '@darkcad/kernel/occ'
+import { make, call } from '@darkcad/kernel/occ'
 import { loadOCC } from '@darkcad/kernel/node'
 import { volume, isValid, zRange, tightBounds } from '@darkcad/kernel/shape'
 import { threadedRod, fuseThreadedBoss, cutThreadedHole } from '../src/thread'
@@ -53,5 +53,37 @@ describe('placement', () => {
     expect(b.max[2]).toBeGreaterThan(7 + 10)
     expect((b.min[0] + b.max[0]) / 2).toBeCloseTo(3, 1)
     expect((b.min[1] + b.max[1]) / 2).toBeCloseTo(-2, 1)
+  })
+})
+
+describe('resizing an existing cylinder to the screw size', () => {
+  const plateAndBoss = (r: number) => {
+    const plate = make(oc, 'BRepPrimAPI_MakeBox', make(oc, 'gp_Pnt', -20, -20, -5), 40, 40, 5).Shape()
+    const boss = make(oc, 'BRepPrimAPI_MakeCylinder', r, 12).Shape()
+    return call(make(oc, 'BRepAlgoAPI_Fuse', plate, boss), 'Shape')
+  }
+  it.each([10, 2.5])('male M8 on a boss of radius %s ends up at exactly the M8 major radius', (r) => {
+    const body = plateAndBoss(r)
+    const out = fuseThreadedBoss(oc, body, { designation: 'M8', kind: 'male', length: 12, origin: [0, 0, 12], dir: [0, 0, -1], existingRadius: r })
+    expect(isValid(oc, out)).toBe(true)
+    // radius of the boss region only (above the plate)
+    const b = tightBounds(oc, out)
+    expect(b.max[2]).toBeGreaterThan(11.9)
+    const probe = make(oc, 'BRepPrimAPI_MakeBox', make(oc, 'gp_Pnt', -30, -30, 0.5), 60, 60, 20).Shape()
+    const boss = call(make(oc, 'BRepAlgoAPI_Common', out, probe), 'Shape')
+    const bb = tightBounds(oc, boss)
+    expect(Math.max(bb.max[0], bb.max[1])).toBeGreaterThan(3.99)
+    expect(Math.max(bb.max[0], bb.max[1])).toBeLessThan(4.02)
+  })
+
+  it('female G1/4 in an oversized hole shrinks it to the tap size', () => {
+    const block = make(oc, 'BRepPrimAPI_MakeBox', make(oc, 'gp_Pnt', -20, -20, 0), 40, 40, 20).Shape()
+    const bigHole = make(oc, 'BRepPrimAPI_MakeCylinder', make(oc, 'gp_Ax2', make(oc, 'gp_Pnt', 0, 0, 20), make(oc, 'gp_Dir', 0, 0, -1)), 9, 12).Shape()
+    const drilled = call(make(oc, 'BRepAlgoAPI_Cut', block, bigHole), 'Shape')
+    const out = cutThreadedHole(oc, drilled, { designation: 'G1/4', kind: 'female', length: 12, origin: [0, 0, 20], dir: [0, 0, -1], existingRadius: 9 })
+    expect(isValid(oc, out)).toBe(true)
+    const removed = volume(oc, block) - volume(oc, out)
+    expect(removed).toBeGreaterThan(Math.PI * (11.8 / 2) ** 2 * 12 * 0.99)
+    expect(removed).toBeLessThan(Math.PI * (13.2 / 2) ** 2 * 12)
   })
 })

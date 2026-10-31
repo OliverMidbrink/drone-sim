@@ -55,8 +55,11 @@ export interface ThreadFeature {
   designation: string
   kind: 'male' | 'female'
   length: number
+  /** Free/open end of the thread, and the direction into the material. */
   origin: Vec3
   dir: Vec3
+  /** Radius of the cylinder the thread was applied to; it is resized to fit the screw. */
+  existingRadius?: number
 }
 
 export interface DeleteFeatureFeature {
