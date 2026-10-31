@@ -57,6 +57,31 @@ describe('feature delete', () => {
     const s = plateWithBoss()
     const top = faces(oc, s).findIndex((f) => Math.abs(zRange(oc, f)[0] - 5) < 1e-3 && Math.abs(zRange(oc, f)[1] - 5) < 1e-3)
     expect(top).toBeGreaterThanOrEqual(0)
-    expect(() => selectProtrusion(oc, s, top, top)).toThrow(/base/)
+    expect(() => selectProtrusion(oc, s, top, top)).toThrow(/base face/)
+  })
+
+  it('works on a small plate where the boss top is not much smaller than the plate (regression)', () => {
+    const plate = make(oc, 'BRepPrimAPI_MakeBox', make(oc, 'gp_Pnt', -10, -5, 0), 20, 10, 10).Shape()
+    const boss = make(oc, 'BRepPrimAPI_MakeCylinder', make(oc, 'gp_Ax2', make(oc, 'gp_Pnt', 0, 0, 10), make(oc, 'gp_Dir', 0, 0, 1)), 5, 10).Shape()
+    const s = call(make(oc, 'BRepAlgoAPI_Fuse', plate, boss), 'Shape')
+    const side = faces(oc, s).findIndex((f) => zRange(oc, f)[1] > 19.9 && zRange(oc, f)[0] < 10.1 && zRange(oc, f)[0] > 9.9)
+    const r = deleteFeature(oc, s, side)
+    expect(volume(oc, r.shape)).toBeCloseTo(2000, 3)
+  })
+
+  it('fills a blind hole (a depression is a feature too)', () => {
+    const block = make(oc, 'BRepPrimAPI_MakeBox', make(oc, 'gp_Pnt', -15, -15, 0), 30, 30, 20).Shape()
+    const hole = make(oc, 'BRepPrimAPI_MakeCylinder', make(oc, 'gp_Ax2', make(oc, 'gp_Pnt', 0, 0, 20), make(oc, 'gp_Dir', 0, 0, -1)), 4, 8).Shape()
+    const s = call(make(oc, 'BRepAlgoAPI_Cut', block, hole), 'Shape')
+    const wall = faces(oc, s).findIndex((f) => { const [a, b] = zRange(oc, f); return a > 11.9 && a < 12.1 && b > 19.9 })
+    expect(wall).toBeGreaterThanOrEqual(0)
+    const r = deleteFeature(oc, s, wall)
+    expect(volume(oc, r.shape)).toBeCloseTo(30 * 30 * 20, 3)
+    expect(faces(oc, r.shape).length).toBe(6)
+  })
+
+  it('refuses to invent a feature on a plain box', () => {
+    const box = make(oc, 'BRepPrimAPI_MakeBox', 10, 10, 10).Shape()
+    expect(() => selectProtrusion(oc, box, 0)).toThrow(/could not find a feature/)
   })
 })
