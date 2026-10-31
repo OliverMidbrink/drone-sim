@@ -1,4 +1,5 @@
 import { FORMAT_VERSION, type Document } from './model'
+import { migrateSketchV1 } from './migrate'
 
 /** Canonical JSON: stable key order, 2-space indent, trailing newline: diff-friendly for git. */
 export function serialize(doc: Document): string {
@@ -11,7 +12,10 @@ export function serialize(doc: Document): string {
 
 type Migration = (raw: any) => any
 /** migrations[n] upgrades version n → n+1. Add one entry whenever FORMAT_VERSION changes. */
-const migrations: Record<number, Migration> = {}
+const migrations: Record<number, Migration> = {
+  2: (raw) => ({ ...raw, mode: 'part', bodyNames: {}, hidden: [] }),
+  1: (raw) => ({ ...raw, features: !Array.isArray(raw.features) ? raw.features : raw.features.map((f: any) => (f?.type === 'sketch' ? { ...f, ...migrateSketchV1(f) } : f)) }),
+}
 
 export function parse(text: string): Document {
   let raw = JSON.parse(text)
@@ -23,5 +27,14 @@ export function parse(text: string): Document {
     raw = { ...m(raw), version: raw.version + 1 }
   }
   if (!Array.isArray(raw.features)) throw new Error('document has no feature list')
+  raw.features = raw.features.map((f: any) => (
+    f?.type === 'sketch' ? { ...f, entities: f.entities ?? [], constraints: f.constraints ?? [] }
+    : f?.type === 'revolve' ? { ...f, profiles: Array.isArray(f.profiles) ? f.profiles : [], extent: f.extent ?? 'full', angle: f.angle ?? 360, mode: f.mode ?? 'new' }
+    : f))
+  // Older autosaves and hand-made files can lack a title; every design needs one to show in its tab.
+  if (!['part', 'assembly', 'hybrid'].includes(raw.mode)) raw.mode = 'part'
+  if (!raw.bodyNames || typeof raw.bodyNames !== 'object') raw.bodyNames = {}
+  if (!Array.isArray(raw.hidden)) raw.hidden = []
+  if (typeof raw.name !== 'string' || !raw.name.trim()) raw.name = 'Untitled'
   return raw as Document
 }

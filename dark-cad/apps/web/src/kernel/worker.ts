@@ -8,6 +8,7 @@ import type { FaceInfo, Request, Response } from './protocol'
 let oc: any
 let last: BuildResult | undefined
 let seq = 0
+const assetCache = new Map<string, Uint8Array>()
 const send = (r: Response, transfer: Transferable[] = []) => (self as any).postMessage(r, transfer)
 
 const ready = (async () => {
@@ -21,8 +22,9 @@ self.onmessage = async (ev: MessageEvent<Request>) => {
   try {
     if (msg.type === 'build') {
       const t0 = performance.now()
-      last = rebuild(oc, msg.doc)
-      const bodies = last.visible.map((id) => ({ id, mesh: tessellate(oc, last!.bodies.get(id)) }))
+      for (const [id, bytes] of Object.entries(msg.assets ?? {})) assetCache.set(id, bytes)
+      last = rebuild(oc, msg.doc, { deps: msg.deps, assets: assetCache, designId: msg.designId })
+      const bodies = last.visible.map((id) => ({ id, root: last!.roots.get(id) ?? id, mesh: tessellate(oc, last!.bodies.get(id)) }))
       const transfer = bodies.flatMap(({ mesh: m }) => [m.positions.buffer, m.normals.buffer, m.indices.buffer, m.edges.buffer] as Transferable[])
       send({ type: 'built', seq: ++seq, bodies, errors: [...last.errors], ms: performance.now() - t0 }, transfer)
     } else if (msg.type === 'step') {

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll } from 'vitest'
 import { loadOCC } from '@darkcad/kernel/node'
 import { volume, faces } from '@darkcad/kernel/shape'
 import { emptyDocument, type Document, type Feature } from '@darkcad/core'
+import { Draft, addRect, addCircle, addSlot, addPolyline } from '@darkcad/sketch'
 import { rebuild } from '../src/rebuild'
 import { fingerprintFace } from '../src/defeature'
 import { zRange } from '@darkcad/kernel/shape'
@@ -9,8 +10,9 @@ import { zRange } from '@darkcad/kernel/shape'
 let oc: any
 beforeAll(async () => { oc = await loadOCC() })
 const doc = (...features: Feature[]): Document => ({ ...emptyDocument('t'), features })
-const rect = (id: string, w: number, h: number, offset = 0): Feature => ({ type: 'sketch', id, name: id, plane: 'XY', offset, entities: [{ id: id + 'r', kind: 'rect', x: -w / 2, y: -h / 2, w, h }] })
-const circ = (id: string, r: number, offset = 0): Feature => ({ type: 'sketch', id, name: id, plane: 'XY', offset, entities: [{ id: id + 'c', kind: 'circle', x: 0, y: 0, r }] })
+const sk = (id: string, build: (d: Draft) => void, plane: 'XY' | 'XZ' | 'YZ' = 'XY', offset = 0): Feature => { const d = new Draft(); build(d); return { type: 'sketch', id, name: id, plane, offset, entities: d.entities, constraints: d.constraints } }
+const rect = (id: string, w: number, h: number, offset = 0): Feature => sk(id, (d) => addRect(d, -w / 2, -h / 2, w, h), 'XY', offset)
+const circ = (id: string, r: number, offset = 0): Feature => sk(id, (d) => addCircle(d, 0, 0, r), 'XY', offset)
 
 describe('rebuild', () => {
   it('extrudes a rectangle', () => {
@@ -20,8 +22,7 @@ describe('rebuild', () => {
   })
 
   it('sketch with an inner circle extrudes as a tube-like hole', () => {
-    const s: Feature = { type: 'sketch', id: 's1', name: 's', plane: 'XY', offset: 0, entities: [
-      { id: 'a', kind: 'rect', x: -10, y: -10, w: 20, h: 20 }, { id: 'b', kind: 'circle', x: 0, y: 0, r: 3 }] }
+    const s = sk('s1', (d) => { addRect(d, -10, -10, 20, 20); addCircle(d, 0, 0, 3) })
     const r = rebuild(oc, doc(s, { type: 'extrude', id: 'e1', name: 'e', sketch: 's1', distance: 4, mode: 'new' }))
     expect(volume(oc, r.bodies.get('e1'))).toBeCloseTo((400 - Math.PI * 9) * 4, 2)
   })

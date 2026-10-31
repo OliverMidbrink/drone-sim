@@ -3,11 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "pnpm --filter @darkcad/web dev",
+    "dev": "pnpm --parallel --filter @darkcad/web --filter @darkcad/server dev",
     "build": "pnpm --filter @darkcad/web build",
     "test": "pnpm -r test",
-    "typecheck": "pnpm --filter @darkcad/web typecheck",
+    "typecheck": "pnpm --filter @darkcad/web --filter @darkcad/server typecheck",
     "e2e": "pnpm build && pnpm --filter @darkcad/web e2e",
-    "desktop": "pnpm --filter @darkcad/desktop start"
+    "desktop": "pnpm --filter @darkcad/desktop start",
+    "dev:web": "pnpm --filter @darkcad/web dev",
+    "server": "pnpm --filter @darkcad/server start"
   }
 }

@@ -16,6 +16,7 @@
     "@darkcad/features": "workspace:*",
     "@darkcad/io": "workspace:*",
     "@darkcad/kernel": "workspace:*",
+    "@darkcad/sketch": "workspace:*",
     "@darkcad/standards": "workspace:*",
     "opencascade.js": "^1.1.1",
     "solid-js": "^1.9.18",

@@ -1,3 +1,6 @@
 export * from './model'
 export * from './store'
 export * from './serialize'
+export * from './migrate'
+export * from './frames'
+export * from './deps'

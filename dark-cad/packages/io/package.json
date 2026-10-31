@@ -3,7 +3,16 @@
   "version": "0.0.0",
   "type": "module",
   "main": "src/index.ts",
-  "scripts": { "test": "vitest run" },
-  "dependencies": { "@darkcad/core": "workspace:*", "@darkcad/features": "workspace:*" },
-  "devDependencies": { "vitest": "^5.0.5", "typescript": "^7.0.2" }
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@darkcad/core": "workspace:*",
+    "@darkcad/features": "workspace:*",
+    "@darkcad/sketch": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.5",
+    "typescript": "^7.0.2"
+  }
 }

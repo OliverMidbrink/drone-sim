@@ -2,7 +2,7 @@ import type { Document } from '@darkcad/core'
 import type { Mesh } from '@darkcad/kernel'
 import type { FaceInfo, Request, Response } from './protocol'
 
-export interface BuildOutput { bodies: { id: string; mesh: Mesh }[]; errors: Map<string, string>; ms: number }
+export interface BuildOutput { bodies: { id: string; root: string; mesh: Mesh }[]; errors: Map<string, string>; ms: number }
 
 /** Typed wrapper around the kernel worker. One request in flight per kind; later builds supersede earlier ones. */
 export class KernelClient {
@@ -40,9 +40,14 @@ export class KernelClient {
     return p
   }
 
-  async build(doc: Document): Promise<BuildOutput> {
+  private sentAssets = new Set<string>()
+  /** `assets` are STEP files by id; each is sent to the worker once and cached there. */
+  async build(doc: Document, extra: { designId?: string; deps?: Record<string, Document>; assets?: Record<string, Uint8Array> } = {}): Promise<BuildOutput> {
     await this.ready
-    const r = await this.queued(() => this.request({ type: 'build', doc }, 'built'))
+    const fresh: Record<string, Uint8Array> = {}
+    for (const [id, bytes] of Object.entries(extra.assets ?? {})) if (!this.sentAssets.has(id)) fresh[id] = bytes
+    const r = await this.queued(() => this.request({ type: 'build', doc, designId: extra.designId, deps: extra.deps ?? {}, assets: fresh }, 'built'))
+    for (const id of Object.keys(fresh)) this.sentAssets.add(id)
     return { bodies: r.bodies, errors: new Map(r.errors), ms: r.ms }
   }
 

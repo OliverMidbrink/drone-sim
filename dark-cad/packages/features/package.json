@@ -9,7 +9,8 @@
   "dependencies": {
     "@darkcad/kernel": "workspace:*",
     "@darkcad/standards": "workspace:*",
-    "@darkcad/core": "workspace:*"
+    "@darkcad/core": "workspace:*",
+    "@darkcad/sketch": "workspace:*"
   },
   "devDependencies": {
     "vitest": "^5.0.5",

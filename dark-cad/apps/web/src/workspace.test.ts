@@ -12,7 +12,7 @@ class MemoryStorage implements Storage {
   setItem(k: string, v: string) { this.m.set(k, v) }
 }
 
-const sketch = (id: string): SketchFeature => ({ type: 'sketch', id, name: id, plane: 'XY', offset: 0, entities: [] })
+const sketch = (id: string): SketchFeature => ({ type: 'sketch', id, name: id, plane: 'XY', offset: 0, entities: [], constraints: [] })
 
 describe('workspace', () => {
   it('starts with one tab named Untitled', () => {
