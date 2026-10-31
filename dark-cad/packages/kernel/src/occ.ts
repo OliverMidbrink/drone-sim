@@ -22,7 +22,7 @@ export function make(oc: any, base: string, ...args: any[]): any {
   const names = [base, ...Array.from({ length: 80 }, (_, i) => `${base}_${i + 1}`)].filter((n) => oc[n])
   for (const n of names) {
     try { return new oc[n](...args) } catch (e: any) {
-      if (!/invalid number of parameters|Cannot pass|expected|no accessible constructor/i.test(String(e?.message ?? e))) throw e
+      if (!/invalid number of parameters|Cannot pass|Cannot convert|expected|no accessible constructor/i.test(String(e?.message ?? e))) throw e
     }
   }
   throw new Error(`no overload of ${base} accepts ${args.length} args`)

@@ -9,14 +9,20 @@ export interface ThreadSpec {
   /** flank angle full included, degrees (60 ISO, 55 Whitworth) */
   angleDeg: number
   length: number
+  /** diameter taper ratio (BSPT 1/16); radius grows by taper/2 per unit length. Default 0 (parallel). */
+  taper?: number
 }
 
 /** Helical thread ridge solid (to fuse onto a minor-diameter core for a male thread). */
 export function threadRidge(oc: any, s: ThreadSpec) {
   const turns = s.length / s.pitch
-  const surf = make(oc, 'Geom_CylindricalSurface', make(oc, 'gp_Ax3'), s.rMinor)
-  const line = make(oc, 'Geom2d_Line', make(oc, 'gp_Pnt2d', 0, 0), make(oc, 'gp_Dir2d', 2 * Math.PI, s.pitch))
-  const tEnd = turns * Math.hypot(2 * Math.PI, s.pitch)
+  const alpha = Math.atan((s.taper ?? 0) / 2) // cone semi-angle
+  const slantPitch = s.pitch / Math.cos(alpha) // v runs along the slant; pitch is measured along the axis
+  const surf = alpha === 0
+    ? make(oc, 'Geom_CylindricalSurface', make(oc, 'gp_Ax3'), s.rMinor)
+    : make(oc, 'Geom_ConicalSurface', make(oc, 'gp_Ax3'), alpha, s.rMinor)
+  const line = make(oc, 'Geom2d_Line', make(oc, 'gp_Pnt2d', 0, 0), make(oc, 'gp_Dir2d', 2 * Math.PI, slantPitch))
+  const tEnd = turns * Math.hypot(2 * Math.PI, slantPitch)
   const edge = make(oc, 'BRepBuilderAPI_MakeEdge', new oc.Handle_Geom2d_Curve_2(line), new oc.Handle_Geom_Surface_2(surf), 0, tEnd).Edge()
   oc.BRepLib.BuildCurves3d_2(edge)
   const spine = make(oc, 'BRepBuilderAPI_MakeWire', edge).Wire()
