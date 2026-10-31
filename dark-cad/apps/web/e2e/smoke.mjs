@@ -24,7 +24,7 @@ await page.reload()
 await step('kernel loads', async () => { await page.waitForFunction(() => document.querySelector('.status span')?.textContent === 'Ready' || /Rebuilt/.test(document.querySelector('.status span')?.textContent ?? ''), null, { timeout: 90000 }) })
 
 await step('draw a rectangle in the sketcher', async () => {
-  await page.getByRole('button', { name: '✎ Sketch' }).click()
+  await page.locator('.ribbon').getByRole('button', { name: 'Sketch', exact: true }).click()
   const c = page.locator('.sketcher canvas')
   await c.waitFor()
   const b = await c.boundingBox()
@@ -38,14 +38,14 @@ await step('draw a rectangle in the sketcher', async () => {
 
 await step('extrude makes a solid', async () => {
   await page.locator('.tree li', { hasText: 'Sketch 1' }).click()
-  await page.getByRole('button', { name: '⬒ Extrude' }).click()
+  await page.locator('.ribbon').getByRole('button', { name: 'Extrude' }).click()
   await waitSolids(1)
   await page.waitForTimeout(300)
   await page.screenshot({ path: `${shots}/2-extrude.png` })
 })
 
 await step('second sketch (circle) + add-extrude makes a boss on top', async () => {
-  await page.getByRole('button', { name: '✎ Sketch' }).click()
+  await page.locator('.ribbon').getByRole('button', { name: 'Sketch', exact: true }).click()
   const c = page.locator('.sketcher canvas')
   await c.waitFor()
   const b = await c.boundingBox()
@@ -56,7 +56,7 @@ await step('second sketch (circle) + add-extrude makes a boss on top', async () 
   // put the sketch on top of the plate: offset = 10 (extrude distance)
   await page.locator('.field', { hasText: 'Offset' }).locator('input').fill('10')
   await page.locator('.tree li', { hasText: 'Sketch 2' }).click()
-  await page.getByRole('button', { name: '⬒ Extrude' }).click()
+  await page.locator('.ribbon').getByRole('button', { name: 'Extrude' }).click()
   await page.waitForTimeout(1500)
   await waitSolids(1)
   await page.screenshot({ path: `${shots}/3-boss.png` })
@@ -87,7 +87,7 @@ const settle = async () => { await page.waitForTimeout(400); await page.waitForF
 await step('boss extends to z=20', async () => { await settle(); const b = await bounds(); if (Math.abs(b.max[2] - 20) > 0.01) throw new Error('max z ' + b.max[2]) })
 
 await step('feature delete removes the boss, undo brings it back', async () => {
-  await page.getByRole('button', { name: '⌫ Delete feature' }).click()
+  await page.locator('.ribbon').getByRole('button', { name: 'Delete feature' }).click()
   const px = await findFacePixel('Cylinder')
   if (!px) throw new Error('no cylinder face found on screen')
   await page.mouse.click(px.x, px.y)
@@ -97,7 +97,7 @@ await step('feature delete removes the boss, undo brings it back', async () => {
   if (Math.abs(b.max[2] - 10) > 0.01) throw new Error('after delete max z ' + b.max[2])
   if (await page.locator('.tree li.err').count()) throw new Error('feature reported an error')
   await page.screenshot({ path: `${shots}/4-deleted.png` })
-  await page.getByRole('button', { name: 'Undo' }).click()
+  await page.locator('.topbar').getByRole('button', { name: 'Undo' }).click()
   await settle()
   const b2 = await bounds()
   if (Math.abs(b2.max[2] - 20) > 0.01) throw new Error('after undo max z ' + b2.max[2])
@@ -105,7 +105,7 @@ await step('feature delete removes the boss, undo brings it back', async () => {
 
 await step('thread tool resizes the Ø10 boss to the G1/4 major diameter', async () => {
   await page.locator('select[title="Thread standard and size"]').selectOption('G1/4')
-  await page.getByRole('button', { name: '⌇ Thread' }).click()
+  await page.locator('.ribbon').getByRole('button', { name: 'Thread' }).click()
   const px = await findFacePixel('Cylinder')
   if (!px) throw new Error('no cylinder face found on screen')
   await page.mouse.click(px.x, px.y)

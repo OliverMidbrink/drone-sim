@@ -5,7 +5,7 @@ import type { Mesh } from '@darkcad/kernel'
 export interface BodyMesh { id: string; mesh: Mesh }
 export interface Pick { body: string; face: number; point: THREE.Vector3; normal: THREE.Vector3 }
 
-const BODY_COLORS = [0x7aa2f7, 0x9ece6a, 0xe0af68, 0xbb9af7, 0x7dcfff]
+const BODY_COLORS = [0xb9c3d3, 0x8da2c4, 0xc4b79a, 0x93b8a0, 0xb893a0]
 
 export class Viewport {
   readonly renderer: THREE.WebGLRenderer
@@ -24,7 +24,7 @@ export class Viewport {
   constructor(private host: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
-    this.renderer.setClearColor(0x14161b)
+    this.renderer.setClearColor(0x0a0a0a)
     host.appendChild(this.renderer.domElement)
     this.camera.up.set(0, 0, 1) // CAD convention: Z up
     this.camera.position.set(60, -80, 50)
@@ -34,7 +34,7 @@ export class Viewport {
     const key = new THREE.DirectionalLight(0xffffff, 1.6)
     key.position.set(80, -60, 120)
     this.scene.add(key)
-    const grid = new THREE.GridHelper(200, 20, 0x3a4050, 0x242833)
+    const grid = new THREE.GridHelper(200, 20, 0x2e2e2e, 0x1a1a1a)
     grid.rotation.x = Math.PI / 2
     this.scene.add(grid, new THREE.AxesHelper(20), this.group, this.overlay)
     new ResizeObserver(() => this.resize()).observe(host)
@@ -63,7 +63,7 @@ export class Viewport {
       const obj = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: BODY_COLORS[i % BODY_COLORS.length], roughness: 0.55, metalness: 0.1, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }))
       const eg = new THREE.BufferGeometry()
       eg.setAttribute('position', new THREE.BufferAttribute(mesh.edges, 3))
-      obj.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: 0x0c0d11 })))
+      obj.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: 0x0a0a0a })))
       this.group.add(obj)
       this.meshes.push({ id, obj, mesh })
     })
@@ -130,7 +130,7 @@ export class Viewport {
       g.setIndex(new THREE.BufferAttribute(m.mesh.indices.subarray(fr.start * 3, (fr.start + fr.count) * 3), 1))
       this.overlay.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthTest: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })))
     }
-    this.selected.forEach((f) => add(f, 0xff9e64, 0.75))
-    if (this.hover) add(this.hover, 0xffffff, 0.35)
+    this.selected.forEach((f) => add(f, 0x3291ff, 0.7))
+    if (this.hover) add(this.hover, 0xffffff, 0.22)
   }
 }

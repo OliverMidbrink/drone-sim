@@ -5,12 +5,13 @@ import { dxfToSketch, meshesToStl, sketchToDxf } from '@darkcad/io'
 import { KernelClient } from './kernel/client'
 import type { FaceInfo } from './kernel/protocol'
 import { Viewport, type BodyMesh, type Pick } from './viewport'
-import { Sketcher } from './sketcher'
+import { Sketcher, type SketchTool } from './sketcher'
+import { Icon, type IconName } from './icons'
 import { platform } from './platform'
 
 type Tool = 'select' | 'thread' | 'delete-feature'
 const AUTOSAVE = 'darkcad:autosave'
-const ICON: Record<Feature['type'], string> = { sketch: '✎', extrude: '⬒', loft: '◭', boolean: '⊕', thread: '⌇', 'delete-feature': '⌫' }
+const ICON: Record<Feature['type'], IconName> = { sketch: 'sketch', extrude: 'extrude', loft: 'loft', boolean: 'combine', thread: 'thread', 'delete-feature': 'deleteFeature' }
 const BODY_TYPES = new Set<Feature['type']>(['extrude', 'loft', 'boolean', 'thread', 'delete-feature'])
 
 function loadInitial(): Store {
@@ -38,6 +39,10 @@ export function App() {
   const [status, setStatus] = createSignal('Loading geometry kernel…')
   const [building, setBuilding] = createSignal(false)
   const [editing, setEditing] = createSignal<string | undefined>()
+  const [sketchTool, setSketchTool] = createSignal<SketchTool>('rect')
+  const [treeOpen, setTreeOpen] = createSignal(true)
+  const [propsOpen, setPropsOpen] = createSignal(true)
+  const [renamingRoot, setRenamingRoot] = createSignal(false)
   const [entitySel, setEntitySel] = createSignal<string | undefined>()
   const [faceSel, setFaceSel] = createSignal<{ body: string; face: number }[]>([])
   const [faceInfo, setFaceInfo] = createSignal<FaceInfo | undefined>()
@@ -110,7 +115,7 @@ export function App() {
   function addSketch() {
     const id = store.nextId('sk')
     store.add({ type: 'sketch', id, name: nameFor('Sketch', 'sketch'), plane: 'XY', offset: 0, entities: [] })
-    select(id); setEditing(id); setEntitySel(undefined)
+    select(id); setEditing(id); setEntitySel(undefined); setPropsOpen(true)
   }
 
   function addExtrude() {
@@ -219,89 +224,120 @@ export function App() {
     else if (e.key === 'f') viewport?.fit()
   }
 
-  const Btn = (p: { label: string; onClick: () => void; title?: string; active?: boolean; disabled?: boolean }) => (
-    <button class={p.active ? 'active' : ''} title={p.title} disabled={p.disabled} onClick={p.onClick}>{p.label}</button>
+  // Ribbon button: icon above label (Fusion-style).
+  const Tool = (p: { icon: IconName; label: string; onClick: () => void; title?: string; active?: boolean; disabled?: boolean }) => (
+    <button class="tool" classList={{ active: p.active }} title={p.title ?? p.label} disabled={p.disabled} onClick={p.onClick}>
+      <Icon name={p.icon} size={20} /><span>{p.label}</span>
+    </button>
+  )
+  const Group = (p: { title: string; children: any }) => (
+    <section class="ribbon-group"><div class="ribbon-tools">{p.children}</div><h4>{p.title}</h4></section>
   )
 
-  const toolHint = () => tool() === 'thread' ? `Thread ${designation()}: click a cylindrical face (boss or hole wall)` : tool() === 'delete-feature' ? 'Feature delete: click any face of the protrusion to remove' : ''
+  const toolHint = () => tool() === 'thread' ? `Thread ${designation()}: click a cylindrical face (boss or hole wall)` : tool() === 'delete-feature' ? 'Delete feature: click any face of the boss, pocket or hole to remove' : ''
+  const newDoc = () => { if (confirm('Discard the current document?')) { store.replace({ ...store.doc, features: [], name: 'Untitled design' }); setSelected([]); setEditing(undefined) } }
+  const startSketchTool = (t: SketchTool) => { if (!editing()) addSketch(); setSketchTool(t) }
 
   return (
     <div class="app">
-      <header class="toolbar">
-        <span class="brand">Dark<b>CAD</b></span>
-        <div class="group">
-          <Btn label="New" onClick={() => { if (confirm('Discard the current document?')) { store.replace({ ...store.doc, features: [], name: 'Untitled' }); setSelected([]); setEditing(undefined) } }} />
-          <Btn label="Open" onClick={openDoc} />
-          <Btn label="Save" title="Ctrl+S" onClick={save} />
-        </div>
-        <div class="group">
-          <Btn label="Undo" title="Ctrl+Z" disabled={!canUndo()} onClick={() => store.undo()} />
-          <Btn label="Redo" title="Ctrl+Shift+Z" disabled={!canRedo()} onClick={() => store.redo()} />
-        </div>
-        <div class="group">
-          <Btn label="✎ Sketch" onClick={addSketch} />
-          <Btn label="⬒ Extrude" onClick={addExtrude} />
-          <Btn label="◭ Loft" onClick={addLoft} />
-          <Btn label="⊕ Combine" onClick={addBoolean} />
-        </div>
-        <div class="group">
-          <select title="Thread standard and size" value={designation()} onChange={(e) => setDesignation(e.currentTarget.value)}>
-            <For each={listDesignations()}>{(d) => <option value={d}>{d}</option>}</For>
-          </select>
-          <Btn label="⌇ Thread" active={tool() === 'thread'} onClick={() => setTool(tool() === 'thread' ? 'select' : 'thread')} />
-          <Btn label="⌫ Delete feature" active={tool() === 'delete-feature'} onClick={() => setTool(tool() === 'delete-feature' ? 'select' : 'delete-feature')} />
-        </div>
-        <div class="group">
-          <Btn label="Import DXF" onClick={importDxf} />
-          <Btn label="DXF" title="Export selected sketch" onClick={exportDxf} />
-          <Btn label="STEP" onClick={exportStep} />
-          <Btn label="STL" onClick={exportStl} />
-          <Btn label="Fit" title="F" onClick={() => viewport?.fit()} />
-        </div>
+      <header class="topbar">
+        <span class="brand"><Icon name="cube" size={16} /><span>Dark<b>CAD</b></span></span>
+        <span class="crumb">{doc().name}</span>
+        <span class="spacer" />
+        <button class="icon-btn" title="Undo (Ctrl+Z)" disabled={!canUndo()} onClick={() => store.undo()}><Icon name="undo" /></button>
+        <button class="icon-btn" title="Redo (Ctrl+Shift+Z)" disabled={!canRedo()} onClick={() => store.redo()}><Icon name="redo" /></button>
+        <button class="icon-btn" title="Fit view (F)" onClick={() => viewport?.fit()}><Icon name="fit" /></button>
       </header>
 
-      <aside class="tree">
-        <h3>Features</h3>
-        <input class="docname" value={doc().name} onChange={(e) => store.rename(e.currentTarget.value)} />
-        <ul>
-          <For each={features()}>{(f) => (
-            <li classList={{ sel: selected().includes(f.id), err: errors().has(f.id), body: visibleIds().includes(f.id) }}
-              title={errors().get(f.id)}
-              onClick={(e) => setSelected(e.ctrlKey || e.metaKey ? (selected().includes(f.id) ? selected().filter((i) => i !== f.id) : [...selected(), f.id]) : [f.id])}
-              onDblClick={() => { if (f.type === 'sketch') { setEditing(f.id); setEntitySel(undefined) } }}>
-              <span class="icon">{ICON[f.type]}</span>
-              <span class="label">{f.name}</span>
-              <Show when={errors().has(f.id)}><span class="badge" title={errors().get(f.id)}>!</span></Show>
-              <Show when={visibleIds().includes(f.id)}><span class="dot" title="visible solid" /></Show>
-            </li>
-          )}</For>
-        </ul>
-        <Show when={!features().length}><p class="empty">Start with <b>✎ Sketch</b>, draw a shape, then <b>⬒ Extrude</b>.</p></Show>
-      </aside>
+      <nav class="ribbon">
+        <Group title="File">
+          <Tool icon="newFile" label="New" onClick={newDoc} />
+          <Tool icon="open" label="Open" onClick={openDoc} />
+          <Tool icon="save" label="Save" title="Save (Ctrl+S)" onClick={save} />
+          <span class="sep" />
+          <Tool icon="import" label="Import" title="Import a DXF as a new sketch" onClick={importDxf} />
+          <Tool icon="export" label="STEP" title="Export all solids as STEP" onClick={exportStep} />
+          <Tool icon="export" label="STL" title="Export all solids as STL" onClick={exportStl} />
+          <Tool icon="export" label="DXF" title="Export the selected sketch as DXF" onClick={exportDxf} />
+        </Group>
+        <Group title="2D">
+          <Tool icon="sketch" label="Sketch" title="New sketch" onClick={addSketch} />
+          <span class="sep" />
+          <Tool icon="select" label="Select" title="Select / move shapes (V)" active={!!editing() && sketchTool() === 'select'} onClick={() => startSketchTool('select')} />
+          <Tool icon="rect" label="Rectangle" title="Rectangle (R)" active={!!editing() && sketchTool() === 'rect'} onClick={() => startSketchTool('rect')} />
+          <Tool icon="circle" label="Circle" title="Circle (C)" active={!!editing() && sketchTool() === 'circle'} onClick={() => startSketchTool('circle')} />
+          <Tool icon="polygon" label="Polygon" title="Polygon (P)" active={!!editing() && sketchTool() === 'polygon'} onClick={() => startSketchTool('polygon')} />
+        </Group>
+        <Group title="3D">
+          <Tool icon="extrude" label="Extrude" onClick={addExtrude} />
+          <Tool icon="loft" label="Loft" title="Loft between two sketches (Ctrl-click to select)" onClick={addLoft} />
+          <Tool icon="combine" label="Combine" title="Union / cut / common of two solids (Ctrl-click to select)" onClick={addBoolean} />
+        </Group>
+        <Group title="Modify">
+          <div class="thread-pick">
+            <Tool icon="thread" label="Thread" title="Thread a cylinder: pick a face" active={tool() === 'thread'} onClick={() => setTool(tool() === 'thread' ? 'select' : 'thread')} />
+            <select title="Thread standard and size" value={designation()} onChange={(e) => setDesignation(e.currentTarget.value)}>
+              <For each={listDesignations()}>{(d) => <option value={d}>{d}</option>}</For>
+            </select>
+          </div>
+          <Tool icon="deleteFeature" label="Delete feature" title="Remove a boss, pocket or hole: pick any of its faces" active={tool() === 'delete-feature'} onClick={() => setTool(tool() === 'delete-feature' ? 'select' : 'delete-feature')} />
+        </Group>
+      </nav>
 
-      <main class="stage">
+      <main class="stage" classList={{ sketching: !!editing() }}>
         <div class="viewport" ref={host} />
-        <Show when={toolHint()}><div class="tool-hint">{toolHint()} · Esc cancels</div></Show>
         <Show when={sketchBeingEdited()}>{(sk) => (
-          <Sketcher store={store} sketch={sk()} selected={entitySel()} onSelect={setEntitySel} onClose={() => setEditing(undefined)} />
+          <Sketcher store={store} sketch={sk()} selected={entitySel()} onSelect={setEntitySel} onClose={() => setEditing(undefined)} tool={sketchTool()} setTool={setSketchTool} />
         )}</Show>
+        <Show when={toolHint()}><div class="tool-hint">{toolHint()} <kbd>Esc</kbd></div></Show>
         <Show when={building()}><div class="busy">building…</div></Show>
-      </main>
 
-      <aside class="props">
-        <h3>Properties</h3>
-        <Show when={primary()} fallback={<p class="empty">Select a feature.</p>}>
-          {(f) => <Properties f={f()} store={store} features={features()} entitySel={entitySel()} setEntitySel={setEntitySel} error={errors().get(f().id)} edit={() => setEditing(f().id)} />}
+        <div class="float tree" classList={{ collapsed: !treeOpen() }}>
+          <div class="tree-root" onClick={() => setTreeOpen(!treeOpen())}>
+            <span class="chev" classList={{ open: treeOpen() }}><Icon name="chevron" size={14} /></span>
+            <Icon name="folder" size={15} />
+            <Show when={!renamingRoot()} fallback={
+              <input class="root-name" value={doc().name} ref={(el) => queueMicrotask(() => el.select())} onClick={(e) => e.stopPropagation()}
+                onBlur={(e) => { store.rename(e.currentTarget.value.trim() || 'Untitled design'); setRenamingRoot(false) }}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); if (e.key === 'Escape') setRenamingRoot(false) }} />
+            }>
+              <span class="root-label" title="Double-click to rename" onDblClick={(e) => { e.stopPropagation(); setRenamingRoot(true) }}>{doc().name}</span>
+            </Show>
+            <span class="count">{features().length}</span>
+          </div>
+          <Show when={treeOpen()}>
+            <ul>
+              <For each={features()}>{(f) => (
+                <li classList={{ sel: selected().includes(f.id), err: errors().has(f.id), body: visibleIds().includes(f.id) }}
+                  title={errors().get(f.id)}
+                  onClick={(e) => { setSelected(e.ctrlKey || e.metaKey ? (selected().includes(f.id) ? selected().filter((i) => i !== f.id) : [...selected(), f.id]) : [f.id]); setPropsOpen(true) }}
+                  onDblClick={() => { if (f.type === 'sketch') { setEditing(f.id); setEntitySel(undefined) } }}>
+                  <span class="icon"><Icon name={ICON[f.type]} size={15} /></span>
+                  <span class="label">{f.name}</span>
+                  <Show when={errors().has(f.id)}><span class="badge" title={errors().get(f.id)}>!</span></Show>
+                  <Show when={visibleIds().includes(f.id)}><span class="dot" title="visible solid" /></Show>
+                </li>
+              )}</For>
+            </ul>
+            <Show when={!features().length}><p class="empty">Empty design. Start with a <b>Sketch</b>, then <b>Extrude</b>.</p></Show>
+          </Show>
+        </div>
+
+        <Show when={primary() && propsOpen()}>
+          <div class="float props">
+            <div class="float-head"><span>Properties</span><button class="icon-btn small" title="Close" onClick={() => setPropsOpen(false)}><Icon name="close" size={14} /></button></div>
+            <Properties f={primary()!} store={store} features={features()} entitySel={entitySel()} setEntitySel={setEntitySel} error={errors().get(primary()!.id)} edit={() => setEditing(primary()!.id)} />
+            <Show when={faceInfo() && faceSel().length}>
+              <h4 class="sub">Picked face</h4>
+              <dl class="kv">
+                <dt>Surface</dt><dd>{faceInfo()!.surface}</dd>
+                <dt>Area</dt><dd>{faceInfo()!.area.toFixed(2)} mm²</dd>
+                <Show when={faceInfo()!.cylinder}><dt>Diameter</dt><dd>{(faceInfo()!.cylinder!.radius * 2).toFixed(3)} mm</dd></Show>
+              </dl>
+            </Show>
+          </div>
         </Show>
-        <Show when={faceInfo() && faceSel().length}>
-          <h3>Face</h3>
-          <dl class="kv">
-            <dt>Surface</dt><dd>{faceInfo()!.surface}</dd>
-            <dt>Area</dt><dd>{faceInfo()!.area.toFixed(2)} mm²</dd>
-            <Show when={faceInfo()!.cylinder}><dt>Diameter</dt><dd>{(faceInfo()!.cylinder!.radius * 2).toFixed(3)} mm</dd></Show>
-          </dl>
-        </Show>
-      </aside>
+      </main>
 
       <footer class="status"><span>{status()}</span><span class="dim">{bodies().length} solid(s) · {features().length} feature(s)</span></footer>
     </div>

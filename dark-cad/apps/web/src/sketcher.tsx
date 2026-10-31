@@ -2,7 +2,7 @@ import { createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 import type { SketchEntity, SketchFeature, Store } from '@darkcad/core'
 import { nesting, outline } from '@darkcad/features'
 
-type Tool = 'select' | 'rect' | 'circle' | 'polygon'
+export type SketchTool = 'select' | 'rect' | 'circle' | 'polygon'
 type Pt = [number, number]
 
 const AXES: Record<string, [string, string]> = { XY: ['X', 'Y'], XZ: ['X', 'Z'], YZ: ['Y', 'Z'] }
@@ -23,12 +23,14 @@ function moved(e: SketchEntity, dx: number, dy: number): SketchEntity {
   return { ...e, x: e.x + dx, y: e.y + dy }
 }
 
-export function Sketcher(props: { store: Store; sketch: SketchFeature; selected: string | undefined; onSelect: (id?: string) => void; onClose: () => void }) {
+export function Sketcher(props: { store: Store; sketch: SketchFeature; selected: string | undefined; onSelect: (id?: string) => void; onClose: () => void; tool: SketchTool; setTool: (t: SketchTool) => void }) {
   let canvas!: HTMLCanvasElement
-  const [tool, setTool] = createSignal<Tool>('rect')
+  const tool = () => props.tool
+  const setTool = props.setTool
   const [snap, setSnap] = createSignal(1)
   const [draft, setDraft] = createSignal<SketchEntity | undefined>()
   const [poly, setPoly] = createSignal<Pt[]>([])
+  createEffect(() => { tool(); setPoly([]) }) // switching tools abandons a half-drawn polygon
   const [cursor, setCursor] = createSignal<Pt>([0, 0])
   const [view, setView] = createSignal({ cx: 0, cy: 0, scale: 8 })
   let start: Pt | undefined
@@ -197,24 +199,16 @@ export function Sketcher(props: { store: Store; sketch: SketchFeature; selected:
   }
   onMount(() => { window.addEventListener('keydown', onKey); onCleanup(() => window.removeEventListener('keydown', onKey)) })
 
-  const Btn = (p: { t: Tool; label: string; key: string }) => (
-    <button class={tool() === p.t ? 'active' : ''} onClick={() => { setTool(p.t); setPoly([]) }} title={`${p.label} (${p.key})`}>{p.label}</button>
-  )
-
   return (
     <div class="sketcher">
       <div class="sketch-bar">
-        <strong>Sketch · {props.sketch.name}</strong>
-        <Btn t="select" label="Select" key="V" />
-        <Btn t="rect" label="Rectangle" key="R" />
-        <Btn t="circle" label="Circle" key="C" />
-        <Btn t="polygon" label="Polygon" key="P" />
+        <span class="sketch-title">Editing <b>{props.sketch.name}</b></span>
         <label class="inline">Snap
           <select value={String(snap())} onChange={(e) => setSnap(parseFloat(e.currentTarget.value))}>
             <option value="0">off</option><option value="0.1">0.1</option><option value="0.5">0.5</option><option value="1">1</option><option value="5">5</option>
           </select>
         </label>
-        <span class="hint">{tool() === 'polygon' ? 'click points · Enter or click first point closes' : 'drag to draw · wheel zoom · right-drag pan · Alt = no snap'}</span>
+        <span class="hint">{tool() === 'polygon' ? 'click points · Enter or click the first point to close' : 'drag to draw · wheel zoom · right-drag pan · Alt = no snap'}</span>
         <button class="primary" onClick={props.onClose}>Finish sketch</button>
       </div>
       <canvas ref={canvas} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onWheel={onWheel} onContextMenu={(e) => e.preventDefault()} onDblClick={() => tool() === 'polygon' && closePoly()} />
