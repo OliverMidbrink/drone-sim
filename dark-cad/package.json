@@ -1,0 +1,6 @@
+{
+  "name": "darkcad",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "pnpm -r test", "dev": "pnpm --filter @darkcad/web dev" }
+}
