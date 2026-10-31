@@ -1,0 +1,17 @@
+{
+  "id": "bspp",
+  "name": "BSP parallel (ISO 228-1, G)",
+  "family": "G",
+  "profile": "whitworth-55",
+  "angleDeg": 55,
+  "source": "ISO 228-1 / BS 2779 basic dimensions; tap drills per common charts",
+  "verified": false,
+  "sizes": [
+    { "designation": "G1/8", "tpi": 28, "pitch": 0.907, "major": 9.728, "tapDrill": 8.8 },
+    { "designation": "G1/4", "tpi": 19, "pitch": 1.337, "major": 13.157, "tapDrill": 11.8 },
+    { "designation": "G3/8", "tpi": 19, "pitch": 1.337, "major": 16.662, "tapDrill": 15.25 },
+    { "designation": "G1/2", "tpi": 14, "pitch": 1.814, "major": 20.955, "tapDrill": 19 },
+    { "designation": "G3/4", "tpi": 14, "pitch": 1.814, "major": 26.441, "tapDrill": 24.5 },
+    { "designation": "G1", "tpi": 11, "pitch": 2.309, "major": 33.249, "tapDrill": 30.75 }
+  ]
+}

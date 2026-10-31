@@ -1,5 +1,6 @@
 import { it, expect } from 'vitest'
-import { loadOCC, make } from '../src/occ'
+import { make } from '../src/occ'
+import { loadOCC } from '../src/node'
 import { writeSTEP, readSTEP } from '../src/step'
 import { faces, volume, isValid } from '../src/shape'
 

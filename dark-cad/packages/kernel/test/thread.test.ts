@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { loadOCC, make } from '../src/occ'
+import { make } from '../src/occ'
+import { loadOCC } from '../src/node'
 import { threadRidge } from '../src/thread'
 
 function props(oc: any, shape: any) {

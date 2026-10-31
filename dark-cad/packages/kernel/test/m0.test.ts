@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest'
-import { loadOCC, make, call } from '../src/occ'
+import { make, call } from '../src/occ'
+import { loadOCC } from '../src/node'
 import { threadRidge } from '../src/thread'
 import { faces, zRange, volume, isValid } from '../src/shape'
 

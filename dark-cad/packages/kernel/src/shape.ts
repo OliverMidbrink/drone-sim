@@ -26,3 +26,12 @@ export function isValid(oc: any, shape: any): boolean {
 }
 
 export function countFaces(oc: any, shape: any): number { return faces(oc, shape).length }
+
+/** Tight bounds: mesh first, then box the triangulation (the geometric box is loose on B-splines). */
+export function tightBounds(oc: any, shape: any, deflection = 0.005) {
+  make(oc, 'BRepMesh_IncrementalMesh', shape, deflection, false, 0.2, false)
+  const b = make(oc, 'Bnd_Box')
+  call(oc.BRepBndLib, 'Add', shape, b, true)
+  const lo = b.CornerMin(), hi = b.CornerMax()
+  return { min: [lo.X(), lo.Y(), lo.Z()] as const, max: [hi.X(), hi.Y(), hi.Z()] as const }
+}

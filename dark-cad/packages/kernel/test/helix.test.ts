@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { loadOCC } from '../src/occ'
+import { loadOCC } from '../src/node'
 
 describe('helix on a cylinder', () => {
   it('rises exactly one pitch per turn, independent of radius', async () => {

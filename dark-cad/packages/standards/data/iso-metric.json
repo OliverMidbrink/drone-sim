@@ -1,0 +1,155 @@
+{
+  "id": "iso-metric",
+  "name": "ISO metric (ISO 68-1 / 262)",
+  "family": "M",
+  "profile": "iso-60",
+  "angleDeg": 60,
+  "source": "ISO 68-1, ISO 262 (pitch series); tap drills per common tap-drill charts",
+  "verified": false,
+  "sizes": [
+    {
+      "designation": "M3",
+      "pitch": 0.5,
+      "major": 3,
+      "tapDrill": 2.5
+    },
+    {
+      "designation": "M4",
+      "pitch": 0.7,
+      "major": 4,
+      "tapDrill": 3.3
+    },
+    {
+      "designation": "M5",
+      "pitch": 0.8,
+      "major": 5,
+      "tapDrill": 4.2
+    },
+    {
+      "designation": "M6",
+      "pitch": 1,
+      "major": 6,
+      "tapDrill": 5
+    },
+    {
+      "designation": "M8",
+      "pitch": 1.25,
+      "major": 8,
+      "tapDrill": 6.8
+    },
+    {
+      "designation": "M10",
+      "pitch": 1.5,
+      "major": 10,
+      "tapDrill": 8.5
+    },
+    {
+      "designation": "M12",
+      "pitch": 1.75,
+      "major": 12,
+      "tapDrill": 10.2
+    },
+    {
+      "designation": "M14",
+      "pitch": 2,
+      "major": 14,
+      "tapDrill": 12
+    },
+    {
+      "designation": "M16",
+      "pitch": 2,
+      "major": 16,
+      "tapDrill": 14
+    },
+    {
+      "designation": "M18",
+      "pitch": 2.5,
+      "major": 18,
+      "tapDrill": 15.5
+    },
+    {
+      "designation": "M20",
+      "pitch": 2.5,
+      "major": 20,
+      "tapDrill": 17.5
+    },
+    {
+      "designation": "M22",
+      "pitch": 2.5,
+      "major": 22,
+      "tapDrill": 19.5
+    },
+    {
+      "designation": "M24",
+      "pitch": 3,
+      "major": 24,
+      "tapDrill": 21
+    },
+    {
+      "designation": "M8x1",
+      "pitch": 1,
+      "major": 8,
+      "tapDrill": 7
+    },
+    {
+      "designation": "M10x1.25",
+      "pitch": 1.25,
+      "major": 10,
+      "tapDrill": 8.8
+    },
+    {
+      "designation": "M10x1",
+      "pitch": 1,
+      "major": 10,
+      "tapDrill": 9
+    },
+    {
+      "designation": "M12x1.5",
+      "pitch": 1.5,
+      "major": 12,
+      "tapDrill": 10.5
+    },
+    {
+      "designation": "M12x1.25",
+      "pitch": 1.25,
+      "major": 12,
+      "tapDrill": 10.8
+    },
+    {
+      "designation": "M14x1.5",
+      "pitch": 1.5,
+      "major": 14,
+      "tapDrill": 12.5
+    },
+    {
+      "designation": "M16x1.5",
+      "pitch": 1.5,
+      "major": 16,
+      "tapDrill": 14.5
+    },
+    {
+      "designation": "M18x1.5",
+      "pitch": 1.5,
+      "major": 18,
+      "tapDrill": 16.5
+    },
+    {
+      "designation": "M20x1.5",
+      "pitch": 1.5,
+      "major": 20,
+      "tapDrill": 18.5
+    },
+    {
+      "designation": "M22x1.5",
+      "pitch": 1.5,
+      "major": 22,
+      "tapDrill": 20.5
+    },
+    {
+      "designation": "M24x2",
+      "pitch": 2,
+      "major": 24,
+      "tapDrill": 22
+    }
+  ]
+}

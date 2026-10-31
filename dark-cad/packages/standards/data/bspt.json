@@ -1,0 +1,18 @@
+{
+  "id": "bspt",
+  "name": "BSP taper (ISO 7-1: R male taper, Rc female taper, Rp female parallel)",
+  "family": "R",
+  "profile": "whitworth-55",
+  "angleDeg": 55,
+  "taper": 0.0625,
+  "source": "ISO 7-1 basic dimensions at the gauge plane; gauge lengths per ISO 7-1 table",
+  "verified": false,
+  "sizes": [
+    { "designation": "R1/8", "tpi": 28, "pitch": 0.907, "major": 9.728, "gaugeLength": 4.0, "tapDrill": 8.4 },
+    { "designation": "R1/4", "tpi": 19, "pitch": 1.337, "major": 13.157, "gaugeLength": 6.0, "tapDrill": 11.2 },
+    { "designation": "R3/8", "tpi": 19, "pitch": 1.337, "major": 16.662, "gaugeLength": 6.4, "tapDrill": 14.75 },
+    { "designation": "R1/2", "tpi": 14, "pitch": 1.814, "major": 20.955, "gaugeLength": 8.2, "tapDrill": 18.25 },
+    { "designation": "R3/4", "tpi": 14, "pitch": 1.814, "major": 26.441, "gaugeLength": 9.5, "tapDrill": 23.75 },
+    { "designation": "R1", "tpi": 11, "pitch": 2.309, "major": 33.249, "gaugeLength": 10.4, "tapDrill": 29.75 }
+  ]
+}

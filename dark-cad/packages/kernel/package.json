@@ -10,5 +10,13 @@
     "opencascade.js": "^1.1.1",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./occ": "./src/occ.ts",
+    "./thread": "./src/thread.ts",
+    "./shape": "./src/shape.ts",
+    "./step": "./src/step.ts",
+    "./node": "./src/node.ts"
   }
 }
