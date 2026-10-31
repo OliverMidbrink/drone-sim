@@ -2,5 +2,12 @@
   "name": "darkcad",
   "private": true,
   "type": "module",
-  "scripts": { "test": "pnpm -r test", "dev": "pnpm --filter @darkcad/web dev" }
+  "scripts": {
+    "dev": "pnpm --filter @darkcad/web dev",
+    "build": "pnpm --filter @darkcad/web build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm --filter @darkcad/web typecheck",
+    "e2e": "pnpm build && pnpm --filter @darkcad/web e2e",
+    "desktop": "pnpm --filter @darkcad/desktop start"
+  }
 }

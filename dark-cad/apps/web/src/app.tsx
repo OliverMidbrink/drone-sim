@@ -82,7 +82,13 @@ export function App() {
   })
 
   onMount(() => {
-    viewport = new Viewport(host)
+    try {
+      viewport = new Viewport(host)
+    } catch (e: any) {
+      setStatus(`3D view unavailable (${String(e.message).split(':').pop()?.trim()}): WebGL is required. Check graphics drivers / hardware acceleration.`)
+      kernel.ready.then(schedule)
+      return
+    }
     // Debug/test hook: lets e2e tests find faces and read results without guessing pixel positions.
     ;(window as any).__darkcad = { viewport, kernel, store, bodies }
     kernel.ready.then(() => { setStatus('Ready'); schedule() })

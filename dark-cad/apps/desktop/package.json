@@ -1,0 +1,13 @@
+{
+  "name": "@darkcad/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "pnpm --filter @darkcad/web build && electron .",
+    "smoke": "electron . --smoke"
+  },
+  "devDependencies": {
+    "electron": "^45.1.0"
+  }
+}
